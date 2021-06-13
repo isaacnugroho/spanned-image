@@ -6,6 +6,7 @@ declare -a CUSTOM_MONITORS
 declare -a REF_MON_H
 declare -a REF_MON_V
 
+declare -r name=0
 declare -r pxWidth=1
 declare -r pxHeight=2
 declare -r mmWidth=3
@@ -18,6 +19,9 @@ declare -r cropX=9
 declare -r cropY=10
 declare -r cropW=11
 declare -r cropH=12
+
+declare -r adjustMmOffsetX=1
+declare -r adjustMmOffsetY=2
 
 declare -i NUM_MONITORS
 declare -i CANVAS_WIDTH=0
@@ -33,11 +37,18 @@ declare -i USABLE_OFFSET_Y=0
 
 declare -a tmpMon
 
+_source=""
+_target=""
+_split="off"
+_basename=""
+_dirname=""
+_ext=""
+
 CUSTOM_CONFIGURATION=~/.config/spanned-image.conf
 
 get_image_size() {
-  if [[ ! -z "$1" && -e "$1" ]]; then
-    eval $(identify -format 'export IMAGE_WIDTH=%w IMAGE_HEIGHT=%h' "$1")
+  if [[ ! -z "$_source" && -e "$_source" ]]; then
+    eval $(identify -format 'export IMAGE_WIDTH=%w IMAGE_HEIGHT=%h' "$_source")
   else
     IMAGE_WIDTH=0
     IMAGE_HEIGHT=0
@@ -62,17 +73,20 @@ determine_canvas() {
 }
 
 determine_references() {
-  (( i = 0 ))
+  REF_MON_H=(${MONITORS[0]})
+  REF_MON_V=(${MONITORS[0]})
+  (( i = 1 ))
+
   while [[ $i -lt $NUM_MONITORS ]]; do
     tmpMon=(${MONITORS[$i]})
 
     if [[ ${tmpMon[${pixelX}]} -eq 0 ]]; then
-      if [[ -z "${REF_MON_H[0]}" || ${REF_MON_H[$pxWidth]} -lt ${tmpMon[$pxWidth]} ]]; then
+      if [[ ${REF_MON_H[$pixelX]} -lt ${tmpMon[$pixelX]} ]]; then
         REF_MON_H=(${tmpMon[*]})
       fi
     fi
     if [[ ${tmpMon[${pixelY}]} -eq 0 ]]; then
-      if [[ -z "${REF_MON_H[0]}" || ${REF_MON_V[$pxHeight]} -lt ${tmpMon[$pxHeight]} ]]; then
+      if [[ ${REF_MON_V[$pixelY]} -lt ${tmpMon[$pixelY]} ]]; then
         REF_MON_V=(${tmpMon[*]})
       fi
     fi
@@ -110,15 +124,15 @@ determine_offsets() {
     (( j = 0 ))
     while [[ $j -lt ${#CUSTOM_MONITORS[*]} ]]; do 
       tmpArr=(${CUSTOM_MONITORS[j]})
-      if [[ "${tmpArr[0]}" == "${tmpMon[0]}" ]]; then
-        if [[ "${tmpArr[1]}" -ne 0 ]]; then
-          (( tmpMon[${mmOffsetX}] = tmpMon[${mmOffsetX}] + tmpArr[1] ))
+      if [[ "${tmpArr[${name}]}" == "${tmpMon[${name}]}" ]]; then
+        if [[ "${tmpArr[${adjustMmOffsetX}]}" -ne 0 ]]; then
+          (( tmpMon[${mmOffsetX}] = tmpMon[${mmOffsetX}] + tmpArr[${adjustMmOffsetX}] ))
           if [[ $adjustX -gt tmpMon[${mmOffsetX}] ]]; then
             (( adjustX = tmpMon[${mmOffsetX}] ))
           fi
         fi
-        if [[ "${tmpArr[2]}" -ne 0 ]]; then
-          (( tmpMon[${mmOffsetY}] = tmpMon[${mmOffsetY}] + tmpArr[2] ))
+        if [[ "${tmpArr[${adjustMmOffsetY}]}" -ne 0 ]]; then
+          (( tmpMon[${mmOffsetY}] = tmpMon[${mmOffsetY}] + tmpArr[${adjustMmOffsetY}] ))
           if [[ $adjustY -gt tmpMon[${mmOffsetY}] ]]; then
             (( adjustY = tmpMon[${mmOffsetY}] ))
           fi
@@ -131,16 +145,16 @@ determine_offsets() {
     (( i = i + 1 ))
   done
 
-  if [[ $adjustX -lt 0 || $adjustY -lt 0 ]]; then
-    (( i = 0 ))
-    while [[ $i -lt $NUM_MONITORS ]]; do
-      tmpMon=(${MONITORS[$i]})
-      (( tmpMon[${mmOffsetX}] = tmpMon[${mmOffsetX}] - adjustX ))
-      (( tmpMon[${mmOffsetY}] = tmpMon[${mmOffsetY}] - adjustY ))
-      MONITORS[$i]="${tmpMon[*]}"
-      (( i = i + 1 ))
-    done
-  fi
+  # if [[ $adjustX -lt 0 || $adjustY -lt 0 ]]; then
+  #   (( i = 0 ))
+  #   while [[ $i -lt $NUM_MONITORS ]]; do
+  #     tmpMon=(${MONITORS[$i]})
+  #     (( tmpMon[${mmOffsetX}] = tmpMon[${mmOffsetX}] - adjustX ))
+  #     (( tmpMon[${mmOffsetY}] = tmpMon[${mmOffsetY}] - adjustY ))
+  #     MONITORS[$i]="${tmpMon[*]}"
+  #     (( i = i + 1 ))
+  #   done
+  # fi
 }
 
 determine_area() {
@@ -169,11 +183,11 @@ calculate_image() {
     (( USABLE_WIDTH = IMAGE_WIDTH ))
     (( USABLE_HEIGHT = _t1 ))
     (( USABLE_OFFSET_X = 0 ))
-    (( USABLE_OFFSET_Y = 2 * (IMAGE_HEIGHT - USABLE_HEIGHT) / 5 ))
+    (( USABLE_OFFSET_Y = (3 * (IMAGE_HEIGHT - USABLE_HEIGHT) + 4) / 8 ))
   else
     (( USABLE_WIDTH = _t2 ))
     (( USABLE_HEIGHT = IMAGE_HEIGHT ))
-    (( USABLE_OFFSET_X = (IMAGE_WIDTH - USABLE_WIDTH) / 2 ))
+    (( USABLE_OFFSET_X = (IMAGE_WIDTH - USABLE_WIDTH + 1) / 2 ))
     (( USABLE_OFFSET_Y = 0 ))
   fi
 }
@@ -195,16 +209,28 @@ calculate_cropping() {
 
 # use imagemagick for composing image
 create_image() {
-  CMD="convert \""$1"\" "
   (( i = 0 ))
-  while [[ $i -lt $NUM_MONITORS ]]; do
-    tmpMon=(${MONITORS[$i]})
-    CMD+="\\( -clone 0 -crop ${tmpMon[${cropW}]}x${tmpMon[${cropH}]}+${tmpMon[${cropX}]}+${tmpMon[${cropY}]} -resize ${tmpMon[${pxWidth}]}x${tmpMon[${pxHeight}]}! -set page +${tmpMon[${pixelX}]}+${tmpMon[${pixelY}]} \\) "
-    (( i = i + 1 ))
-  done
-  CMD+="-delete 0 -set page ${CANVAS_WIDTH}x${CANVAS_HEIGHT} -flatten \""$2"\""
+  if [[ "$_split" == "off" ]]; then
+    CMD="convert \""$_source"\" "
+    while [[ $i -lt $NUM_MONITORS ]]; do
+      tmpMon=(${MONITORS[$i]})
+      CMD+="\\( -clone 0 -crop ${tmpMon[${cropW}]}x${tmpMon[${cropH}]}+${tmpMon[${cropX}]}+${tmpMon[${cropY}]} -resize ${tmpMon[${pxWidth}]}x${tmpMon[${pxHeight}]}! -set page +${tmpMon[${pixelX}]}+${tmpMon[${pixelY}]} \\) "
+      (( i = i + 1 ))
+    done
+    CMD+="-delete 0 -set page ${CANVAS_WIDTH}x${CANVAS_HEIGHT} -flatten \""$_target"\""
 
-  eval $CMD
+    eval "$CMD"
+  else
+    while [[ $i -lt $NUM_MONITORS ]]; do
+      tmpMon=(${MONITORS[$i]})
+      CMD="convert \""$_source"\" "
+      CMD+="-crop ${tmpMon[${cropW}]}x${tmpMon[${cropH}]}+${tmpMon[${cropX}]}+${tmpMon[${cropY}]} -resize ${tmpMon[${pxWidth}]}x${tmpMon[${pxHeight}]}! "
+      CMD+=" \"""${_dirname}"/"${_basename}"_${tmpMon[0]}.${_ext}"\""
+
+      eval "$CMD"
+      (( i = i + 1 ))
+    done
+  fi
 }
 
 print_variables() {
@@ -224,43 +250,74 @@ print_variables() {
   echo "REF_MON_V=(${REF_MON_V[@]})"
   echo "CUSTOM_MONITORS=(${CUSTOM_MONITORS[@]})"
 
-  echo "pxWidth=${pxWidth}"
-  echo "pxHeight=${pxHeight}"
-  echo "mmWidth=${mmWidth}"
-  echo "mmHeight=${mmHeight}"
-  echo "pixelX=${pixelX}"
-  echo "pixelY=${pixelY}"
-  echo "mmOffsetX=${mmOffsetX}"
-  echo "mmOffsetY=${mmOffsetY}"
-  echo "cropX=${cropX}"
-  echo "cropY=${cropY}"
-  echo "cropW=${cropW}"
-  echo "cropH=${cropH}"
+  (( i = 0 ))
+  while [[ $i -lt $NUM_MONITORS ]]; do
+    tmpMon=(${MONITORS[$i]})
+    echo "${tmpMon[${name}]}"
+    echo "  pxWidth=${tmpMon[${pxWidth}]}"
+    echo "  pxHeight=${tmpMon[${pxHeight}]}"
+    echo "  mmWidth=${tmpMon[${mmWidth}]}"
+    echo "  mmHeight=${tmpMon[${mmHeight}]}"
+    echo "  pixelX=${tmpMon[${pixelX}]}"
+    echo "  pixelY=${tmpMon[${pixelY}]}"
+    echo "  mmOffsetX=${tmpMon[${mmOffsetX}]}"
+    echo "  mmOffsetY=${tmpMon[${mmOffsetY}]}"
+    echo "  cropX=${tmpMon[${cropX}]}"
+    echo "  cropY=${tmpMon[${cropY}]}"
+    echo "  cropW=${tmpMon[${cropW}]}"
+    echo "  cropH=${tmpMon[${cropH}]}"
+    (( i = i + 1 ))
+  done
 }
 
 main_routine() {
   if [[ -e "$CUSTOM_CONFIGURATION" ]]; then
     source "$CUSTOM_CONFIGURATION"
   fi
-  eval $(xrandr --listactivemonitors \
+
+    eval $(xrandr --listactivemonitors \
     | sed -r -e 's#([0-9]+)/([0-9]+)x([0-9]+)/([0-9]+)\+([0-9]+)\+([0-9]+)#\1 \2 \3 \4 \5 \6 #g' -e 's/^ *([0-9]+):\s+/\1 /' -e 's/[: ]+/ /g' \
     | awk -F '[ :]' '/^Monitors/ { print "NUM_MONITORS=" $2 } \
         /^[0-9]+/ { printf "MON_%s=(%s %s %s %s %s %s %s)\nMONITORS+=(\"%s %s %s %s %s %s %s\")\n", $1, $9, $3, $5, $4, $6, $7, $8, $9, $3, $5, $4, $6, $7, $8 }' )
 
-  if [[ "$NUM_MONITORS" -eq 1 ]]; then
-    cp $1 $2
-  else
-    get_image_size "$1"
+  if [[ "$NUM_MONITORS" -gt 1 ]]; then
+    get_image_size
 
     if [[ "$IMAGE_WIDTH" -gt 0 ]]; then
       determine_canvas
       determine_area
       calculate_image
       calculate_cropping
-      create_image "$1" "$2"
+      create_image
     fi
   fi
 }
 
-main_routine "$1" "$2"
+# -- entry point --
+if [[ $# -lt 2 ]]; then
+  exit 1
+fi
+if [[ "$1" == "-s" ]]; then
+  _source="$2"
+  _target="$3"
+  _split="on"
+  _dirname=$(dirname "$_target")
+  _basename=$(basename "$_target")
+  _ext=${_target##*.}
+else
+  _source="$1"
+  _target="$2"
+  _split="off"
+fi
+if [[ -z "$_target" ]]; then
+  exit 1
+fi
+  
+_dirname=$(dirname "$_target")
+_basename=$(basename "$_target")
+_ext=${_target##*.}
+_basename=${_basename%.*}
+
+main_routine
+
 # print_variables
