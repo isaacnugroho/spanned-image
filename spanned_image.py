@@ -1,30 +1,58 @@
 #!/usr/bin/python
-
-from screeninfo import Monitor, get_monitors
+import screeninfo
+from screeninfo import Monitor
 from dataclasses import dataclass
-from PIL import Image
+from PIL import Image, ImageFilter
 import sys
 import os
 import configparser
 
 
 DEFAULT_DOT_PER_MM = 120 * 25.4
+DEBUG = False
 
 
 @dataclass
-class MonitorInfo:
+class Configuration:
+  padding: bool = False
+  crop: float = 0.0
+  debug: bool = True
+  __config = None
+
+  def __init__(self):
+    _found_config = find_config_file()
+    if _found_config is not None:
+      self.__config = configparser.RawConfigParser()
+      self.__config.read(_found_config)
+      _padding = str(self.__config.get('Config', 'padding', fallback=self.padding))
+      _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
+      _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
+      self.crop = _crop if 0.0 <= _crop <= 20.0 else 0.0
+      self.padding = _padding.upper() in ['TRUE', 'ON']
+
+  def config(self):
+    return self.__config
+
+  def get(self, section_name, key_name, fallback=None):
+    if self.__config is None:
+      return fallback
+    return self.__config.get(section_name, key_name, fallback=fallback)
+
+
+@dataclass
+class DisplayInfo:
   x: int
   y: int
   width: int
   height: int
   mm_offset_x: int = 0
   mm_offset_y: int = 0
-  width_mm: float = None
-  height_mm: float = None
   name: str = None
+  mm_x: float = None
+  mm_y: float = None
+  mm_width: float = None
+  mm_height: float = None
   is_primary: bool = None
-  mm_x: int = None
-  mm_y: int = None
   offset_x_from: str = None
   offset_y_from: str = None
 
@@ -40,180 +68,333 @@ class MonitorInfo:
     self.is_primary = (monitor.is_primary is not None and monitor.is_primary)
     self.name = monitor.name
     if monitor.width_mm is None:
-      self.width_mm = monitor.width / DEFAULT_DOT_PER_MM
+      self.mm_width = monitor.width / DEFAULT_DOT_PER_MM
     else:
-      self.width_mm = float(monitor.width_mm)
+      self.mm_width = float(monitor.width_mm)
     if monitor.height_mm is None:
-      self.height_mm = monitor.height / DEFAULT_DOT_PER_MM
+      self.mm_height = monitor.height / DEFAULT_DOT_PER_MM
     else:
-      self.height_mm = float(monitor.height_mm)
+      self.mm_height = float(monitor.height_mm)
+
+  def rect(self):
+    return Rect(self.x, self.y, self.width, self.height)
+
+  def mm_rect(self):
+    return Rect(self.mm_x, self.mm_y, self.mm_width, self.mm_height)
+
+  def mm_right(self):
+    return self.mm_x + self.mm_width
+
+  def mm_bottom(self):
+    return self.mm_y + self.mm_height
 
 
-def build_monitors(config):
-  monitors = {}
-  for m in get_monitors():
-    monitor_info = MonitorInfo(m)
-    monitors[m.name] = monitor_info
+def build_displays(config: Configuration):
+  displays = {}
+  for m in screeninfo.get_monitors():
+    display = DisplayInfo(m)
+    displays[m.name] = display
+  return normalize_displays(displays, config)
+
+
+def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
+  for display in displays.values():
     if config is not None:
-      monitor_info.mm_offset_x = int(config.get(m.name, 'offsetX', fallback='0'))
-      monitor_info.mm_offset_y = int(config.get(m.name, 'offsetY', fallback='0'))
-      monitor_info.mm_offset_x_from = config.get(m.name, 'offsetXFrom', fallback=None)
-      monitor_info.mm_offset_y_from = config.get(m.name, 'offsetYFrom', fallback=None)
-  return normalize_monitors(monitors)
+      display.mm_offset_x = int(config.get(display.name, 'offsetX', fallback='0'))
+      display.mm_offset_y = int(config.get(display.name, 'offsetY', fallback='0'))
+      display.mm_offset_x_from = config.get(display.name, 'offsetXFrom', fallback=None)
+      display.mm_offset_y_from = config.get(display.name, 'offsetYFrom', fallback=None)
+
+    if display.offset_x_from is None or display.offset_x_from not in displays.keys():
+      display.offset_x_from = find_display_left(display, displays)
+    if display.offset_x_from is None:
+      display.mm_x = display.mm_offset_x
+
+    if display.offset_y_from is None or display.offset_y_from not in displays.keys():
+      display.offset_y_from = find_display_above(display, displays)
+    if display.offset_y_from is None:
+      display.mm_y = display.mm_offset_y
+
+  # set position of display with reference
+  for display in displays.values():
+    if display.offset_x_from is not None:
+      adjust_horz_position(display, displays, [display.name])
+    if display.offset_y_from is not None:
+      adjust_vert_position(display, displays, [display.name])
+  mm_origin_x = min([m.mm_x for m in displays.values()])
+  mm_origin_y = min([m.mm_y for m in displays.values()])
+  if mm_origin_y < 0 or mm_origin_x < 0:
+    for display in displays.values():
+      display.mm_x -= mm_origin_x
+      display.mm_y -= mm_origin_y
+  return displays
 
 
-def normalize_monitors(monitors: {str: MonitorInfo}):
-  for monitor in monitors.values():
-    if monitor.offset_x_from is None or monitor.offset_x_from not in monitors.keys():
-      monitor.offset_x_from = find_adjacent_monitor_horz(monitor, monitors)
-    if monitor.offset_x_from is None:
-      monitor.mm_x = monitor.mm_offset_x
-
-    if monitor.offset_y_from is None or monitor.offset_y_from not in monitors.keys():
-      monitor.offset_y_from = find_adjacent_monitor_vert(monitor, monitors)
-    if monitor.offset_y_from is None:
-      monitor.mm_y = monitor.mm_offset_y
-
-  # set position of monitor with reference
-  for monitor in monitors.values():
-    if monitor.offset_x_from is not None:
-      adjust_horz_position(monitor, monitors, [monitor.name])
-    if monitor.offset_y_from is not None:
-      adjust_vert_position(monitor, monitors, [monitor.name])
-  return monitors
-
-
-def find_adjacent_monitor_horz(monitor: MonitorInfo, monitors: {str: MonitorInfo}):
+def find_display_left(display: DisplayInfo, displays: {str: DisplayInfo}):
   candidates = {}
-  for ref in monitors.values():
-    if ref.name != monitor.name \
-        and ref.x < monitor.x:
-      delta_x = ref.x + ref.width - monitor.x
-      delta_y = ref.y - monitor.y
+  for ref in displays.values():
+    if ref.name != display.name \
+        and ref.x < display.x:
+      delta_x = ref.x + ref.width - display.x
+      delta_y = ref.y - display.y
       candidates[ref.name] = delta_x * delta_x + delta_y + delta_y
-
-  print(str(candidates))
   if candidates:
     sorted_list = sorted((value, key) for (key, value) in candidates.items())
     return sorted_list[0][1]
   return None
 
 
-def find_adjacent_monitor_vert(monitor: MonitorInfo, monitors: {str: MonitorInfo}):
+def find_display_above(display: DisplayInfo, displays: {str: DisplayInfo}):
   candidates = {}
-  for ref in monitors.values():
-    if ref.name != monitor.name \
-        and ref.y < monitor.y:
-      delta_x = ref.x - monitor.x
-      delta_y = ref.y + ref.height - monitor.y
+  for ref in displays.values():
+    if ref.name != display.name \
+        and ref.y < display.y:
+      delta_x = ref.x - display.x
+      delta_y = ref.y + ref.height - display.y
       candidates[ref.name] = delta_x * delta_x + delta_y + delta_y
-
-  print(str(candidates))
   if candidates:
     sorted_list = sorted((value, key) for (key, value) in candidates.items())
     return sorted_list[0][1]
   return None
 
 
-def adjust_horz_position(monitor: MonitorInfo, monitors: {str: MonitorInfo}, visited: [str]):
-  next_name = monitor.offset_x_from
+def adjust_horz_position(display: DisplayInfo, displays: {str: DisplayInfo}, visited: [str]):
+  next_name = display.offset_x_from
   if next_name is None or next_name in visited:  # avoid recursive
-    if monitor.mm_x is None:
-      monitor.mm_x = monitor.mm_offset_x
+    if display.mm_x is None:
+      display.mm_x = display.mm_offset_x
   else:
-    next_monitor = monitors[next_name]
+    next_display = displays[next_name]
     visited += next_name
-    ref_point = adjust_horz_position(next_monitor, monitors, visited)
-    monitor.mm_x = monitor.mm_offset_x + ref_point
-  return monitor.mm_x + monitor.width_mm
+    ref_point = adjust_horz_position(next_display, displays, visited)
+    display.mm_x = display.mm_offset_x + ref_point
+  return display.mm_x + display.mm_width
 
 
-def adjust_vert_position(monitor: MonitorInfo, monitors: {str: MonitorInfo}, visited: [str]):
-  next_name = monitor.offset_y_from
+def adjust_vert_position(display: DisplayInfo, displays: {str: DisplayInfo}, visited: [str]):
+  next_name = display.offset_y_from
   if next_name is None or next_name in visited:  # avoid recursive
-    if monitor.mm_y is None:
-      monitor.mm_y = monitor.mm_offset_y
+    if display.mm_y is None:
+      display.mm_y = display.mm_offset_y
   else:
-    next_monitor = monitors[next_name]
+    next_display = displays[next_name]
     visited += next_name
-    ref_point = adjust_vert_position(next_monitor, monitors, visited)
-    monitor.mm_y = monitor.mm_offset_y + ref_point
-  return monitor.mm_y + monitor.height_mm
+    ref_point = adjust_vert_position(next_display, displays, visited)
+    display.mm_y = display.mm_offset_y + ref_point
+  return display.mm_y + display.mm_height
 
 
 @dataclass
 class Rect:
-  x: float
-  y: float
-  width: float
-  height: float
+  x: int | float
+  y: int | float
+  width: int | float
+  height: int | float
+
+  def size(self):
+    return int(round(self.width)), int(round(self.height))
+
+  def position(self):
+    return self.x, self.y
+
+  def box(self):
+    return int(round(self.x)), int(round(self.y)), \
+           int(round(self.x + self.width)), int(round(self.y + self.height))
+
+  def copy(self):
+    return Rect(self.x, self.y, self.width, self.height)
+
+  def __init__(self, x: int | float, y: int | float, width: int | float, height: int | float):
+    self.x = x
+    self.y = y
+    self.width = width
+    self.height = height
+
+  def vh_ratio(self):
+    return float(self.height) / self.width
+
+  def center(self):
+    return self.x + self.width / 2, self.y + self.height / 2
+
+  @staticmethod
+  def of(image: Image):
+    return Rect(0, 0, image.width, image.height)
+
+  @staticmethod
+  def of_tuple(values: ()):
+    if values is None:
+      return Rect(0, 0, 0, 0)
+    if len(values) == 2:
+      return Rect(0, 0, float(values[0]), float(values[1]))
+    elif len(values) >= 4:
+      x = float(values[0])
+      y = float(values[1])
+      w = float(values[2]) - x + 1
+      h = float(values[3]) - y + 1
+      return Rect(x, y, w, h)
+    return Rect(0, 0, 0, 0)
 
 
 @dataclass
 class Canvas:
-  monitors: {str: MonitorInfo}
-  display_width: int
-  display_height: int
-  canvas_rect: Rect
-  image_rect: Rect = None
-  _image: Image = None
+  displays: {str: DisplayInfo}
+  __display_width: int
+  __display_height: int
+  __canvas_rect: Rect = None
+  __canvas_ratio: float = 1.0
+  __image_size: Rect = None
+  __fit_rect: Rect = None
+  __image: Image = None
+  __padding: bool = False
+  __crop: float = 0.0
 
-  def __init__(self, monitors):
-    mm_origin_x = min([m.mm_x for m in monitors.values()])
-    mm_origin_y = min([m.mm_y for m in monitors.values()])
-    mm_width = max([m.mm_x + m.width_mm for m in monitors.values()]) - mm_origin_x
-    mm_height = max([m.mm_y + m.height_mm for m in monitors.values()]) - mm_origin_y
-    display_width = max([m.width + m.x for m in monitors.values()])
-    display_height = max([m.height + m.y for m in monitors.values()])
-    self.monitors = monitors
-    self.display_width = display_width
-    self.display_height = display_height
-    self.canvas_rect = Rect(mm_origin_x, mm_origin_y, mm_width, mm_height)
+  def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
+    assert displays is not None
+    mm_width = max([m.mm_x + m.mm_width for m in displays.values()])
+    mm_height = max([m.mm_y + m.mm_height for m in displays.values()])
+    display_width = max([m.width + m.x for m in displays.values()])
+    display_height = max([m.height + m.y for m in displays.values()])
+    self.displays = displays
+    self.__display_width = display_width
+    self.__display_height = display_height
+    self.__canvas_rect = Rect(0, 0, mm_width, mm_height)
+    self.__canvas_ratio = self.__canvas_rect.vh_ratio()
+    if config is not None:
+      self.__padding = config.padding
+      self.__crop = config.crop
+
+  def display_size(self):
+    return self.__display_width, self.__display_height
 
   def set_image(self, image: Image):
-    self._image = image
-    canvas_ratio = float(self.canvas_rect.height) / self.canvas_rect.width
-    image_ratio = float(image.height) / image.width
-    x = 0.0
-    y = 0.0
-    width = float(image.width)
-    height = float(image.height)
-    if canvas_ratio <= image_ratio:
-      height = image.width * canvas_ratio
-      y = (image.height - height) * 0.5
-    else:
-      width = image.height / canvas_ratio
-      x = (image.width - width) * 0.5
-    self.image_rect = Rect(x, y, width, height)
+    self.__prepare_image(image)
 
   def get_image(self):
-    return self._image
+    return self.__image
 
   def paint(self) -> Image:
-    result = Image.new('RGB', (self.display_width, self.display_height), 'black')
-    if self._image is None:
-      return result
+    target = Image.new('RGB', self.display_size(), 'black')
+    if self.__image is None:
+      return target
 
-    assert self.image_rect is not None
-    horz_ratio = self.image_rect.width / self.canvas_rect.width
-    vert_ratio = self.image_rect.height / self.canvas_rect.height
+    assert self.__fit_rect is not None
+    fit_rect = self.__fit_rect
+    source_image = self.__image
 
-    for m in self.monitors.values():
-      x1 = horz_ratio * (m.mm_x - self.canvas_rect.x) + self.image_rect.x
-      y1 = vert_ratio * (m.mm_y - self.canvas_rect.y) + self.image_rect.y
-      x2 = horz_ratio * m.width_mm + x1 - 1.0
-      y2 = vert_ratio * m.height_mm + y1 - 1.0
-      src_box = (int(x1), int(y1), int(x2), int(y2))
-      source_img = self._image.crop(src_box)
-      print(str(src_box), y2 / x2)
-      print(str(source_img.size), float(source_img.height) / source_img.width)
-      from PIL.Image import BICUBIC
-      source_img = source_img.resize((m.width, m.height), BICUBIC)
-      target_box = (m.x, m.y)
-      result.paste(source_img, target_box)
-      print(str(target_box))
-      print(str(source_img.size), float(source_img.height) / source_img.width)
-    return result
+    ratio = fit_rect.width / self.__canvas_rect.width
+    if DEBUG:
+      print('image_rect:', str(self.__image_size))
+      print('fit_rect:', str(fit_rect))
+      print('canvas_rect:', str(self.__canvas_rect))
+    for display in self.displays.values():
+      source_rect = Canvas.__compute_source_rect(ratio, fit_rect, display)
+      if DEBUG:
+        print('display:', str(display))
+        print('source_rect:', str(source_rect))
+      source_img = source_image.crop(source_rect.box())
+      display_rect = display.rect()
+      source_img = source_img.resize(display_rect.size(), Image.BILINEAR)
+      target.paste(source_img, display_rect.position())
+
+    return target
+
+  def __prepare_image(self, image):
+    image_rect = Rect.of(image)
+    image_ratio = image_rect.vh_ratio()
+    if self.__canvas_ratio == image_ratio:
+      self.__image = image
+      self.__image_size = image_rect
+      self.__fit_rect = image_rect
+      return
+    (adjusted_image, fit_rect) = self.__adjust_image(image, image_ratio)
+    self.__image = adjusted_image
+    self.__image_size = Rect.of(adjusted_image)
+    self.__fit_rect = fit_rect
+
+  def __adjust_image(self, image: Image, image_ratio: float) -> (Image, Rect):
+    cropped = Canvas.__crop_image(image, self.__crop, image_ratio, self.__canvas_ratio)
+    image_rect = Rect.of(cropped)
+    _image_ratio = image_rect.vh_ratio()
+    if self.__canvas_ratio < _image_ratio:
+      image_rect.height = cropped.width * self.__canvas_ratio
+      image_rect.y = (cropped.height - image_rect.height) * 0.5
+    else:
+      image_rect.width = cropped.height / self.__canvas_ratio
+      image_rect.x = (cropped.width - image_rect.width) * 0.5
+
+    if self.__padding:
+      padded = Canvas.__pad_image(cropped, image_rect, _image_ratio, self.__canvas_ratio)
+      return padded, Rect.of(padded)
+    return cropped, image_rect
+
+  @staticmethod
+  def __compute_source_rect(ratio: float, fit_rect: Rect, display: DisplayInfo) -> Rect:
+    x = ratio * display.mm_x + fit_rect.x
+    y = ratio * display.mm_y + fit_rect.y
+    width = ratio * display.mm_width
+    height = ratio * display.mm_height
+    return Rect(x, y, width, height)
+
+  @staticmethod
+  def __pad_image(image: Image, pad_rect: Rect, image_ratio: float, canvas_ratio: float) -> Image:
+    image_rect = Rect.of(image)
+    from PIL import ImageFilter
+    source = image.filter(ImageFilter.BoxBlur(radius=16))
+    x = 0
+    y = 0
+    if image_ratio > canvas_ratio:
+      adjusted_width = image_rect.height / canvas_ratio
+      x = round((adjusted_width - image_rect.width) * 0.5)
+      image_rect.width = int(round(adjusted_width))
+    else:
+      adjusted_height = image_rect.width * canvas_ratio
+      y = round((adjusted_height - image_rect.height) * 0.5)
+      image_rect.height = int(round(adjusted_height))
+    target = source.resize(image_rect.size(), Image.NEAREST, pad_rect.box())
+    target.paste(image, (x, y))
+    return target
+
+  @staticmethod
+  def __crop_image(image: Image, crop_pct: float, image_ratio: float, canvas_ratio: float) -> Image:
+    if crop_pct == 0.0 or image_ratio == canvas_ratio:
+      return image
+    is_wider = image_ratio < canvas_ratio
+    crop = (100.0 - crop_pct) * 0.01
+    feature_box = Canvas.__find_edges(image, crop, is_wider)
+    target = image.crop(feature_box.box())
+    return target
+
+  @staticmethod
+  def __find_edges(image: Image, crop: float, is_wider: bool) -> Rect:
+    image_rect = Rect.of(image)
+    img = image.convert('L')
+    edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 2, 0))
+    bbox = Rect.of_tuple(Image.Image.getbbox(edge))
+    (cx, cy) = image_rect.center()
+    (bx, by) = bbox.center()
+    if DEBUG:
+      print('bbox', str(bbox), bx, by)
+      edge.save('/tmp/edge.png')
+    if bx == 0 and by == 0:
+      bx = cx
+      by = cy
+
+    if is_wider:
+      bbox.y = 0
+      bbox.height = image_rect.height
+      adjusted_width = bbox.width * crop
+      c_crop = cx * crop
+      image_rect.width = int(round(adjusted_width))
+      image_rect.x = max(int(round(bx - c_crop)), 0)
+    else:
+      bbox.x = 0
+      bbox.width = image_rect.width
+      adjusted_height = bbox.height * crop
+      c_crop = cy * crop
+      image_rect.height = int(round(adjusted_height))
+      image_rect.y = max(int(round(by - c_crop)), 0)
+    print(str(bbox))
+    return bbox
 
 
 # from tensorboard's util.py
@@ -225,9 +406,6 @@ def get_user_config_directory():
     appdata = os.getenv('APPDATA')
     if appdata:
       return appdata
-    appdata = os.getenv('PUBLIC')
-    if appdata:
-      return appdata
     return None
   xdg_config_home = os.getenv('XDG_CONFIG_HOME')
   if xdg_config_home:
@@ -236,25 +414,16 @@ def get_user_config_directory():
 
 
 def find_config_file():
-  _config_location = os.path.join(os.path.dirname(__file__), 'spanned-image.ini')
-  if os.path.exists(_config_location):
-    return _config_location
+  _local_config = os.path.join(os.path.dirname(__file__), 'spanned-image.ini')
   _user_config_path = get_user_config_directory()
-  if _user_config_path is None:
-    return None
-  _config_location = os.path.join(_user_config_path, 'spanned-image.ini')
-  if os.path.exists(_config_location):
-    return _config_location
+  _user_config = None
+  if _user_config_path is not None:
+    _user_config = os.path.join(_user_config_path, 'spanned-image.ini')
+  if _user_config is not None and os.path.exists(_user_config):
+    return _user_config
+  elif os.path.exists(_local_config):
+    return _local_config
   return None
-
-
-def read_config_file():
-  _config_file = find_config_file()
-  if _config_file is None:
-    return None
-  config = configparser.RawConfigParser()
-  config.read(_config_file)
-  return config
 
 
 def read_image(input_file) -> Image:
@@ -263,18 +432,17 @@ def read_image(input_file) -> Image:
 
 
 def spanned_image(input_file, output_file):
-  config = read_config_file()
-  monitors = build_monitors(config)
-  canvas = Canvas(monitors)
+  config = Configuration()
+  displays = build_displays(config)
+  canvas = Canvas(displays, config)
   image = read_image(input_file)
   canvas.set_image(image)
-  print(str(canvas))
   result = canvas.paint()
   result.save(output_file)
 
 
 def print_monitors():
-  for m in get_monitors():
+  for m in screeninfo.get_monitors():
     print(str(m))
 
 
