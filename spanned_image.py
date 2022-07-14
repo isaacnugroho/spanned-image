@@ -389,23 +389,21 @@ class Canvas:
       edge.save('/tmp/edge.png')
 
     if is_wider:
-      if bx != cx:
-        adjusted_width = int(round(image_rect.width * crop))
-        c_crop = cx * crop
-        bx = max(int(round(bx - c_crop)), 0)
-        if bx + adjusted_width > image_rect.width:
-          bx -= image_rect.width - adjusted_width
-        image_rect.x = bx
-        image_rect.width = adjusted_width
+      adjusted_width = int(round(image_rect.width * crop))
+      c_crop = cx * crop
+      bx = max(int(round(bx - c_crop)), 0)
+      if bx + adjusted_width > image_rect.width:
+        bx = image_rect.width - adjusted_width - 1
+      image_rect.x = bx
+      image_rect.width = adjusted_width
     else:
-      if by != cy:
-        adjusted_height = int(round(image_rect.height * crop))
-        c_crop = cy * crop
-        by = max(int(round(by - c_crop)), 0)
-        if by + adjusted_height > image_rect.height:
-          by -= image_rect.height - adjusted_height
-        image_rect.y = by
-        image_rect.height = adjusted_height
+      adjusted_height = int(round(image_rect.height * crop))
+      c_crop = cy * crop
+      by = max(int(round(by - c_crop)), 0)
+      if by + adjusted_height > image_rect.height:
+        by = image_rect.height - adjusted_height + 1
+      image_rect.y = by
+      image_rect.height = adjusted_height
     print(str(image_rect))
     return image_rect
 
