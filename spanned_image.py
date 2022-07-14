@@ -9,7 +9,9 @@ import configparser
 
 
 DEFAULT_DOT_PER_MM = 120 * 25.4
+MAX_CROP = 34
 DEBUG = False
+# DEBUG = True
 
 
 @dataclass
@@ -27,7 +29,7 @@ class Configuration:
       _padding = str(self.__config.get('Config', 'padding', fallback=self.padding))
       _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
       _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
-      self.crop = _crop if 0.0 <= _crop <= 20.0 else 0.0
+      self.crop = _crop if 0.0 <= _crop <= MAX_CROP else 0.0
       self.padding = _padding.upper() in ['TRUE', 'ON']
 
   def config(self):
@@ -216,6 +218,12 @@ class Rect:
   def center(self):
     return self.x + self.width / 2, self.y + self.height / 2
 
+  def shrink(self, n=1):
+    return Rect(self.x + n, self.y + n, self.width - n * 2, self.height - n * 2)
+
+  def grow(self, n=1):
+    return Rect(self.x - n, self.y - n, self.width + n * 2, self.height + n * 2)
+
   @staticmethod
   def of(image: Image):
     return Rect(0, 0, image.width, image.height)
@@ -227,11 +235,11 @@ class Rect:
     if len(values) == 2:
       return Rect(0, 0, float(values[0]), float(values[1]))
     elif len(values) >= 4:
-      x = float(values[0])
-      y = float(values[1])
-      w = float(values[2]) - x + 1
-      h = float(values[3]) - y + 1
-      return Rect(x, y, w, h)
+      x0 = float(values[0])
+      y0 = float(values[1])
+      x1 = float(values[2])
+      y1 = float(values[3])
+      return Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
     return Rect(0, 0, 0, 0)
 
 
@@ -362,39 +370,44 @@ class Canvas:
     crop = (100.0 - crop_pct) * 0.01
     feature_box = Canvas.__find_edges(image, crop, is_wider)
     target = image.crop(feature_box.box())
+    if DEBUG:
+      target.save('/tmp/cropped.png')
     return target
 
   @staticmethod
   def __find_edges(image: Image, crop: float, is_wider: bool) -> Rect:
     image_rect = Rect.of(image)
-    img = image.convert('L')
-    edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 2, 0))
-    bbox = Rect.of_tuple(Image.Image.getbbox(edge))
+    img = image.convert('L').filter(ImageFilter.BoxBlur(radius=5))
+    edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 1.0, -30))
+    edge = edge.crop(image_rect.shrink().box())
+    box = Image.Image.getbbox(edge)
+    box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
     (cx, cy) = image_rect.center()
-    (bx, by) = bbox.center()
+    (bx, by) = box_rect.center()
     if DEBUG:
-      print('bbox', str(bbox), bx, by)
+      print(str(image_rect), str(box_rect), bx, by, box)
       edge.save('/tmp/edge.png')
-    if bx == 0 and by == 0:
-      bx = cx
-      by = cy
 
     if is_wider:
-      bbox.y = 0
-      bbox.height = image_rect.height
-      adjusted_width = bbox.width * crop
-      c_crop = cx * crop
-      image_rect.width = int(round(adjusted_width))
-      image_rect.x = max(int(round(bx - c_crop)), 0)
+      if bx != cx:
+        adjusted_width = int(round(image_rect.width * crop))
+        c_crop = cx * crop
+        bx = max(int(round(bx - c_crop)), 0)
+        if bx + adjusted_width > image_rect.width:
+          bx -= image_rect.width - adjusted_width
+        image_rect.x = bx
+        image_rect.width = adjusted_width
     else:
-      bbox.x = 0
-      bbox.width = image_rect.width
-      adjusted_height = bbox.height * crop
-      c_crop = cy * crop
-      image_rect.height = int(round(adjusted_height))
-      image_rect.y = max(int(round(by - c_crop)), 0)
-    print(str(bbox))
-    return bbox
+      if by != cy:
+        adjusted_height = int(round(image_rect.height * crop))
+        c_crop = cy * crop
+        by = max(int(round(by - c_crop)), 0)
+        if by + adjusted_height > image_rect.height:
+          by -= image_rect.height - adjusted_height
+        image_rect.y = by
+        image_rect.height = adjusted_height
+    print(str(image_rect))
+    return image_rect
 
 
 # from tensorboard's util.py
