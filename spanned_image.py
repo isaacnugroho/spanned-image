@@ -10,8 +10,9 @@ import configparser
 
 DEFAULT_DOT_PER_MM = 120 * 25.4
 MAX_CROP = 34
-DEBUG = False
-# DEBUG = True
+#DEBUG = False
+DEBUG = True
+ZERO = 'Zero'
 
 
 @dataclass
@@ -107,22 +108,62 @@ def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
       display.mm_offset_x_from = config.get(display.name, 'offsetXFrom', fallback=None)
       display.mm_offset_y_from = config.get(display.name, 'offsetYFrom', fallback=None)
 
-    if display.offset_x_from is None or display.offset_x_from not in displays.keys():
-      display.offset_x_from = find_display_left(display, displays)
-    if display.offset_x_from is None:
+    if display.offset_x_from == ZERO:
       display.mm_x = display.mm_offset_x
+      display.offset_x_from = None
+    else:
+      if display.offset_x_from is None or display.offset_x_from not in displays.keys():
+        display.offset_x_from = find_display_left(display, displays)
+      if display.offset_x_from is None:
+        display.mm_x = display.mm_offset_x
 
-    if display.offset_y_from is None or display.offset_y_from not in displays.keys():
-      display.offset_y_from = find_display_above(display, displays)
-    if display.offset_y_from is None:
-      display.mm_y = display.mm_offset_y
+    if display.offset_y_from == ZERO:
+      display.mm_y = display.mm_offset_x
+      display.offset_y_from = None
+    else:
+      if display.offset_y_from is None or display.offset_y_from not in displays.keys():
+        display.offset_y_from = find_display_above(display, displays)
+      if display.offset_y_from is None:
+        display.mm_y = display.mm_offset_y
 
   # set position of display with reference
+
+  visits: {str} = []
+  display_queue: [str] = []
+
   for display in displays.values():
-    if display.offset_x_from is not None:
-      adjust_horz_position(display, displays, [display.name])
-    if display.offset_y_from is not None:
-      adjust_vert_position(display, displays, [display.name])
+    if display.offset_x_from is None:
+      visits.append(display.name)
+    else:
+      display_queue.append(display.name)
+  while len(display_queue) > 0:
+    elem = display_queue.pop(0)
+    display = displays[elem]
+    if display.offset_x_from in visits:
+      adjust_horz_position(display, displays)
+      visits.append(elem)
+    else:
+      display_queue.append(elem)
+      if DEBUG:
+        print('push:', elem)
+
+  visits = []
+  display_queue = []
+
+  for display in displays.values():
+    if display.offset_y_from is None:
+      visits.append(display.name)
+    else:
+      display_queue.append(display.name)
+  while len(display_queue) > 0:
+    elem = display_queue.pop(0)
+    display = displays[elem]
+    if display.offset_y_from in visits:
+      adjust_vert_position(display, displays)
+      visits.append(elem)
+    else:
+      display_queue.append(elem)
+
   mm_origin_x = min([m.mm_x for m in displays.values()])
   mm_origin_y = min([m.mm_y for m in displays.values()])
   if mm_origin_y < 0 or mm_origin_x < 0:
@@ -160,28 +201,26 @@ def find_display_above(display: DisplayInfo, displays: {str: DisplayInfo}):
   return None
 
 
-def adjust_horz_position(display: DisplayInfo, displays: {str: DisplayInfo}, visited: [str]):
+def adjust_horz_position(display: DisplayInfo, displays: {str: DisplayInfo}):
   next_name = display.offset_x_from
-  if next_name is None or next_name in visited:  # avoid recursive
+  if next_name is None:  # avoid recursive
     if display.mm_x is None:
       display.mm_x = display.mm_offset_x
   else:
     next_display = displays[next_name]
-    visited += next_name
-    ref_point = adjust_horz_position(next_display, displays, visited)
+    ref_point = adjust_horz_position(next_display, displays)
     display.mm_x = display.mm_offset_x + ref_point
   return display.mm_x + display.mm_width
 
 
-def adjust_vert_position(display: DisplayInfo, displays: {str: DisplayInfo}, visited: [str]):
+def adjust_vert_position(display: DisplayInfo, displays: {str: DisplayInfo}):
   next_name = display.offset_y_from
-  if next_name is None or next_name in visited:  # avoid recursive
+  if next_name is None:  # avoid recursive
     if display.mm_y is None:
       display.mm_y = display.mm_offset_y
   else:
     next_display = displays[next_name]
-    visited += next_name
-    ref_point = adjust_vert_position(next_display, displays, visited)
+    ref_point = adjust_vert_position(next_display, displays)
     display.mm_y = display.mm_offset_y + ref_point
   return display.mm_y + display.mm_height
 
@@ -301,7 +340,7 @@ class Canvas:
         print('source_rect:', str(source_rect))
       source_img = source_image.crop(source_rect.box())
       display_rect = display.rect()
-      source_img = source_img.resize(display_rect.size(), Image.BILINEAR)
+      source_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
       target.paste(source_img, display_rect.position())
 
     return target
@@ -358,7 +397,7 @@ class Canvas:
       adjusted_height = image_rect.width * canvas_ratio
       y = round((adjusted_height - image_rect.height) * 0.5)
       image_rect.height = int(round(adjusted_height))
-    target = source.resize(image_rect.size(), Image.NEAREST, pad_rect.box())
+    target = source.resize(image_rect.size(), Image.Resampling.BILINEAR, pad_rect.box())
     target.paste(image, (x, y))
     return target
 
@@ -404,7 +443,6 @@ class Canvas:
         by = image_rect.height - adjusted_height + 1
       image_rect.y = by
       image_rect.height = adjusted_height
-    print(str(image_rect))
     return image_rect
 
 
