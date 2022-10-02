@@ -10,16 +10,16 @@ import configparser
 
 DEFAULT_DOT_PER_MM = 120 * 25.4
 MAX_CROP = 34
-#DEBUG = False
-DEBUG = True
 ZERO = 'Zero'
 
 
 @dataclass
 class Configuration:
   padding: bool = False
+  trim: bool = False
   crop: float = 0.0
-  debug: bool = True
+  debug: bool = False
+
   __config = None
 
   def __init__(self):
@@ -27,11 +27,12 @@ class Configuration:
     if _found_config is not None:
       self.__config = configparser.RawConfigParser()
       self.__config.read(_found_config)
-      _padding = str(self.__config.get('Config', 'padding', fallback=self.padding))
-      _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
       _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
       self.crop = _crop if 0.0 <= _crop <= MAX_CROP else 0.0
+      _padding = str(self.__config.get('Config', 'padding', fallback=self.padding))
       self.padding = _padding.upper() in ['TRUE', 'ON']
+      _trim = str(self.__config.get('Config', 'padding', fallback=self.trim))
+      self.trim = _trim.upper() in ['TRUE', 'ON']
 
   def config(self):
     return self.__config
@@ -101,6 +102,15 @@ def build_displays(config: Configuration):
 
 
 def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
+
+  setup_initial_positions(config, displays)
+  adjust_horizontal_positions(displays)
+  adjust_vertical_positions(displays)
+  normalize_positions(displays)
+  return displays
+
+
+def setup_initial_positions(config, displays):
   for display in displays.values():
     if config is not None:
       display.mm_offset_x = int(config.get(display.name, 'offsetX', fallback='0'))
@@ -126,11 +136,10 @@ def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
       if display.offset_y_from is None:
         display.mm_y = display.mm_offset_y
 
-  # set position of display with reference
 
+def adjust_horizontal_positions(displays):
   visits: {str} = []
   display_queue: [str] = []
-
   for display in displays.values():
     if display.offset_x_from is None:
       visits.append(display.name)
@@ -144,12 +153,11 @@ def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
       visits.append(elem)
     else:
       display_queue.append(elem)
-      if DEBUG:
-        print('push:', elem)
 
-  visits = []
-  display_queue = []
 
+def adjust_vertical_positions(displays):
+  visits: {str} = []
+  display_queue: [str] = []
   for display in displays.values():
     if display.offset_y_from is None:
       visits.append(display.name)
@@ -164,13 +172,14 @@ def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
     else:
       display_queue.append(elem)
 
+
+def normalize_positions(displays):
   mm_origin_x = min([m.mm_x for m in displays.values()])
   mm_origin_y = min([m.mm_y for m in displays.values()])
   if mm_origin_y < 0 or mm_origin_x < 0:
     for display in displays.values():
       display.mm_x -= mm_origin_x
       display.mm_y -= mm_origin_y
-  return displays
 
 
 def find_display_left(display: DisplayInfo, displays: {str: DisplayInfo}):
@@ -294,6 +303,8 @@ class Canvas:
   __image: Image = None
   __padding: bool = False
   __crop: float = 0.0
+  __debug: bool = False
+  __trim: bool = False
 
   def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
     assert displays is not None
@@ -309,6 +320,8 @@ class Canvas:
     if config is not None:
       self.__padding = config.padding
       self.__crop = config.crop
+      self.__debug = config.debug
+      self.__trim = config.trim
 
   def display_size(self):
     return self.__display_width, self.__display_height
@@ -329,13 +342,13 @@ class Canvas:
     source_image = self.__image
 
     ratio = fit_rect.width / self.__canvas_rect.width
-    if DEBUG:
+    if self.__debug:
       print('image_rect:', str(self.__image_size))
       print('fit_rect:', str(fit_rect))
       print('canvas_rect:', str(self.__canvas_rect))
     for display in self.displays.values():
       source_rect = Canvas.__compute_source_rect(ratio, fit_rect, display)
-      if DEBUG:
+      if self.__debug:
         print('display:', str(display))
         print('source_rect:', str(source_rect))
       source_img = source_image.crop(source_rect.box())
@@ -359,7 +372,7 @@ class Canvas:
     self.__fit_rect = fit_rect
 
   def __adjust_image(self, image: Image, image_ratio: float) -> (Image, Rect):
-    cropped = Canvas.__crop_image(image, self.__crop, image_ratio, self.__canvas_ratio)
+    cropped = Canvas.__crop_image(image, self.__crop, image_ratio, self.__canvas_ratio, self.__trim)
     image_rect = Rect.of(cropped)
     _image_ratio = image_rect.vh_ratio()
     if self.__canvas_ratio < _image_ratio:
@@ -402,31 +415,30 @@ class Canvas:
     return target
 
   @staticmethod
-  def __crop_image(image: Image, crop_pct: float, image_ratio: float, canvas_ratio: float) -> Image:
+  def __crop_image(
+      image: Image, crop_pct: float, image_ratio: float, canvas_ratio: float, trim: bool) -> Image:
     if crop_pct == 0.0 or image_ratio == canvas_ratio:
       return image
     is_wider = image_ratio < canvas_ratio
     crop = (100.0 - crop_pct) * 0.01
-    feature_box = Canvas.__find_edges(image, crop, is_wider)
+    feature_box = Canvas.__find_edges(image, crop, is_wider, trim)
     target = image.crop(feature_box.box())
-    if DEBUG:
-      target.save('/tmp/cropped.png')
     return target
 
   @staticmethod
-  def __find_edges(image: Image, crop: float, is_wider: bool) -> Rect:
+  def __find_edges(image: Image, crop: float, is_wider: bool, trim: bool) -> Rect:
     image_rect = Rect.of(image)
-    img = image.convert('L').filter(ImageFilter.BoxBlur(radius=5))
-    edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 1.0, -30))
-    edge = edge.crop(image_rect.shrink().box())
-    box = Image.Image.getbbox(edge)
-    box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
+    box_rect: Rect
+    if trim:
+      img = image.convert('L').filter(ImageFilter.BoxBlur(radius=5))
+      edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 1.0, -30))
+      edge = edge.crop(image_rect.shrink().box())
+      box = Image.Image.getbbox(edge)
+      box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
+    else:
+      box_rect = image_rect.copy()
     (cx, cy) = image_rect.center()
     (bx, by) = box_rect.center()
-    if DEBUG:
-      print(str(image_rect), str(box_rect), bx, by, box)
-      edge.save('/tmp/edge.png')
-
     if is_wider:
       adjusted_width = int(round(image_rect.width * crop))
       c_crop = cx * crop
