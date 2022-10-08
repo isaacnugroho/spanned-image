@@ -6,6 +6,7 @@ from PIL import Image, ImageFilter
 import sys
 import os
 import configparser
+import logging
 
 
 DEFAULT_DOT_PER_MM = 120 * 25.4
@@ -33,6 +34,9 @@ class Configuration:
       self.padding = _padding.upper() in ['TRUE', 'ON']
       _trim = str(self.__config.get('Config', 'padding', fallback=self.trim))
       self.trim = _trim.upper() in ['TRUE', 'ON']
+      _debug = str(self.__config.get('Config', 'debug', fallback=self.debug))
+      self.debug = _debug.upper() in ['TRUE', 'ON']
+
 
   def config(self):
     return self.__config
@@ -303,7 +307,6 @@ class Canvas:
   __image: Image = None
   __padding: bool = False
   __crop: float = 0.0
-  __debug: bool = False
   __trim: bool = False
 
   def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
@@ -320,7 +323,6 @@ class Canvas:
     if config is not None:
       self.__padding = config.padding
       self.__crop = config.crop
-      self.__debug = config.debug
       self.__trim = config.trim
 
   def display_size(self):
@@ -342,15 +344,13 @@ class Canvas:
     source_image = self.__image
 
     ratio = fit_rect.width / self.__canvas_rect.width
-    if self.__debug:
-      print('image_rect:', str(self.__image_size))
-      print('fit_rect:', str(fit_rect))
-      print('canvas_rect:', str(self.__canvas_rect))
+    logging.debug('image_rect: %s', str(self.__image_size))
+    logging.debug('fit_rect: %s', str(fit_rect))
+    logging.debug('canvas_rect: %s', str(self.__canvas_rect))
     for display in self.displays.values():
       source_rect = Canvas.__compute_source_rect(ratio, fit_rect, display)
-      if self.__debug:
-        print('display:', str(display))
-        print('source_rect:', str(source_rect))
+      logging.debug('display: %s', str(display))
+      logging.debug('source_rect: %s', str(source_rect))
       source_img = source_image.crop(source_rect.box())
       display_rect = display.rect()
       source_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
@@ -492,14 +492,17 @@ def read_image(input_file) -> Image:
   return _image
 
 
-def spanned_image(input_file, output_file):
-  config = Configuration()
+def spanned_image(config, input_file, output_file):
   displays = build_displays(config)
   canvas = Canvas(displays, config)
   image = read_image(input_file)
   canvas.set_image(image)
   result = canvas.paint()
-  result.save(output_file)
+  logging.debug('saving image: %s', output_file)
+  try:
+    result.save(output_file)
+  except Exception as e:
+    logging.error("saving writing %s with error %s", output_file, e)
 
 
 def print_monitors():
@@ -512,6 +515,12 @@ def print_usage():
 
 
 def main():
+  config = Configuration()
+  if config.debug:
+    logging.basicConfig(filename='/tmp/spanned_image.log', level=logging.DEBUG, format='')
+  else:
+    logging.basicConfig(filename='/tmp/spanned_image.log', level=logging.INFO, format='')
+  logging.info('parameters: %s', sys.argv)
   if len(sys.argv) != 3:
     print_usage()
     print_monitors()
@@ -520,7 +529,11 @@ def main():
       print(image.size)
 
   else:
-    spanned_image(sys.argv[1], sys.argv[2])
+    try:
+      logging.debug('parameters: %s %s', sys.argv[1], sys.argv[2])
+      spanned_image(config, sys.argv[1], sys.argv[2])
+    except Exception as e:
+      logging.error("Exception %s", e)
 
 
 if __name__ == '__main__':
