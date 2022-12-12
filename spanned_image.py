@@ -20,6 +20,7 @@ class Configuration:
   trim: bool = False
   crop: float = 0.0
   debug: bool = False
+  center: str = ''
 
   __config = None
 
@@ -37,7 +38,6 @@ class Configuration:
       _debug = str(self.__config.get('Config', 'debug', fallback=self.debug))
       self.debug = _debug.upper() in ['TRUE', 'ON']
 
-
   def config(self):
     return self.__config
 
@@ -45,6 +45,69 @@ class Configuration:
     if self.__config is None:
       return fallback
     return self.__config.get(section_name, key_name, fallback=fallback)
+
+
+@dataclass
+class Position:
+  x: int | float
+  y: int | float
+
+
+@dataclass
+class Rect:
+  x: int | float
+  y: int | float
+  width: int | float
+  height: int | float
+
+  def size(self):
+    return int(round(self.width)), int(round(self.height))
+
+  def position(self):
+    return self.x, self.y
+
+  def box(self):
+    return int(round(self.x)), int(round(self.y)), \
+           int(round(self.x + self.width)), int(round(self.y + self.height))
+
+  def copy(self):
+    return Rect(self.x, self.y, self.width, self.height)
+
+  def __init__(self, x: int | float, y: int | float, width: int | float, height: int | float):
+    self.x = x
+    self.y = y
+    self.width = width
+    self.height = height
+
+  def vh_ratio(self):
+    return float(self.height) / self.width
+
+  def center(self):
+    return Position(self.x + self.width / 2, self.y + self.height / 2)
+
+  def shrink(self, n=1):
+    return Rect(self.x + n, self.y + n, self.width - n * 2, self.height - n * 2)
+
+  def grow(self, n=1):
+    return Rect(self.x - n, self.y - n, self.width + n * 2, self.height + n * 2)
+
+  @staticmethod
+  def of(image: Image):
+    return Rect(0, 0, image.width, image.height)
+
+  @staticmethod
+  def of_tuple(values: ()):
+    if values is None:
+      return Rect(0, 0, 0, 0)
+    if len(values) == 2:
+      return Rect(0, 0, float(values[0]), float(values[1]))
+    elif len(values) >= 4:
+      x0 = float(values[0])
+      y0 = float(values[1])
+      x1 = float(values[2])
+      y1 = float(values[3])
+      return Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+    return Rect(0, 0, 0, 0)
 
 
 @dataclass
@@ -97,6 +160,174 @@ class DisplayInfo:
     return self.mm_y + self.mm_height
 
 
+@dataclass
+class Canvas:
+  displays: {str: DisplayInfo}
+  __display_width: int
+  __display_height: int
+  __canvas_rect: Rect = None
+  __canvas_ratio: float = 1.0
+  __image_size: Rect = None
+  __fit_rect: Rect = None
+  __image: Image = None
+  __padding: bool = False
+  __crop: float = 0.0
+  __trim: bool = False
+  __canvas_center: Position = None
+  __offset: Position = None
+
+  def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
+    assert displays is not None
+    mm_width = max([m.mm_x + m.mm_width for m in displays.values()])
+    mm_height = max([m.mm_y + m.mm_height for m in displays.values()])
+    display_width = max([m.width + m.x for m in displays.values()])
+    display_height = max([m.height + m.y for m in displays.values()])
+    self.displays = displays
+    self.__display_width = display_width
+    self.__display_height = display_height
+    self.__canvas_rect = Rect(0, 0, mm_width, mm_height)
+    self.__canvas_ratio = self.__canvas_rect.vh_ratio()
+    self.__canvas_center = self.__canvas_rect.center()
+    if config is not None:
+      self.__padding = config.padding
+      self.__crop = config.crop
+      self.__trim = config.trim
+      self.__offset = self.__set_offset(config)
+
+  def display_size(self):
+    return self.__display_width, self.__display_height
+
+  def set_image(self, image: Image):
+    self.__prepare_image(image)
+
+  def get_image(self):
+    return self.__image
+
+  def paint(self) -> Image:
+    target = Image.new('RGB', self.display_size(), 'black')
+    if self.__image is None:
+      return target
+
+    assert self.__fit_rect is not None
+    source_image = self.__image
+
+    ratio = self.__fit_rect.width / self.__canvas_rect.width
+    logging.debug('image_rect: %s', str(self.__image_size))
+    logging.debug('fit_rect: %s', str(self.__fit_rect))
+    logging.debug('canvas_rect: %s', str(self.__canvas_rect))
+    for display in self.displays.values():
+      source_rect = Canvas.__compute_source_rect(ratio, self.__fit_rect, display)
+      logging.debug('display: %s', str(display))
+      logging.debug('source_rect: %s', str(source_rect))
+      source_img = source_image.crop(source_rect.box())
+      display_rect = display.rect()
+      source_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
+      target.paste(source_img, display_rect.position())
+    return target
+
+  def __prepare_image(self, image):
+    image_rect = Rect.of(image)
+    image_ratio = image_rect.vh_ratio()
+    if self.__canvas_ratio == image_ratio:
+      self.__image = image
+      self.__image_size = image_rect
+      self.__fit_rect = image_rect
+      return
+    (adjusted_image, fit_rect) = self.__adjust_image(image, image_ratio)
+    self.__image = adjusted_image
+    self.__image_size = Rect.of(adjusted_image)
+    self.__fit_rect = fit_rect
+
+  def __set_offset(self, config: Configuration):
+    if config.center in self.displays.keys():
+      display = self.displays[config.center]
+      display_center: Position = display.mm_rect().center()
+      return Position(display_center.x, display_center.y)
+    return None
+
+  def __adjust_image(self, image: Image, image_ratio: float) -> (Image, Rect):
+    cropped = self.__crop_image(image, image_ratio)
+    image_rect = Rect.of(cropped)
+    _image_ratio = image_rect.vh_ratio()
+    if self.__canvas_ratio < _image_ratio:
+      image_rect.height = cropped.width * self.__canvas_ratio
+      image_rect.y = (cropped.height - image_rect.height) * 0.5
+    else:
+      image_rect.width = cropped.height / self.__canvas_ratio
+      image_rect.x = (cropped.width - image_rect.width) * 0.5
+
+    if self.__padding:
+      padded = self.__pad_image(cropped, image_rect, _image_ratio)
+      return padded, Rect.of(padded)
+    return cropped, image_rect
+
+  @staticmethod
+  def __compute_source_rect(ratio: float, fit_rect: Rect, display: DisplayInfo) -> Rect:
+    x = ratio * display.mm_x + fit_rect.x
+    y = ratio * display.mm_y + fit_rect.y
+    width = ratio * display.mm_width
+    height = ratio * display.mm_height
+    return Rect(x, y, width, height)
+
+  def __pad_image(self, image: Image, pad_rect: Rect, image_ratio: float) -> Image:
+    image_rect = Rect.of(image)
+    from PIL import ImageFilter
+    source = image.filter(ImageFilter.BoxBlur(radius=16))
+    x = 0
+    y = 0
+    if image_ratio > self.__canvas_ratio:
+      adjusted_width = image_rect.height / self.__canvas_ratio
+      x = round((adjusted_width - image_rect.width) * 0.5)
+      image_rect.width = int(round(adjusted_width))
+    else:
+      adjusted_height = image_rect.width * self.__canvas_ratio
+      y = round((adjusted_height - image_rect.height) * 0.5)
+      image_rect.height = int(round(adjusted_height))
+    target = source.resize(image_rect.size(), Image.Resampling.BILINEAR, pad_rect.box())
+    target.paste(image, (x, y))
+    return target
+
+  def __crop_image(self, image: Image, image_ratio: float) -> Image:
+    if self.__crop == 0.0 or image_ratio == self.__canvas_ratio:
+      return image
+    is_wider = image_ratio < self.__canvas_ratio
+    crop = (100.0 - self.__crop) * 0.01
+    feature_box = self.__find_edges(image, crop, is_wider)
+    target = image.crop(feature_box.box())
+    return target
+
+  def __find_edges(self, image: Image, crop: float, is_wider: bool) -> Rect:
+    image_rect = Rect.of(image)
+    box_rect: Rect
+    if self.__trim:
+      img = image.convert('L').filter(ImageFilter.BoxBlur(radius=5))
+      edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 1.0, -30))
+      edge = edge.crop(image_rect.shrink().box())
+      box = Image.Image.getbbox(edge)
+      box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
+    else:
+      box_rect = image_rect.copy()
+    (cx, cy) = image_rect.center()
+    (bx, by) = box_rect.center()
+    if is_wider:
+      adjusted_width = int(round(image_rect.width * crop))
+      c_crop = cx * crop
+      bx = max(int(round(bx - c_crop)), 0)
+      if bx + adjusted_width > image_rect.width:
+        bx = image_rect.width - adjusted_width - 1
+      image_rect.x = bx
+      image_rect.width = adjusted_width
+    else:
+      adjusted_height = int(round(image_rect.height * crop))
+      c_crop = cy * crop
+      by = max(int(round(by - c_crop)), 0)
+      if by + adjusted_height > image_rect.height:
+        by = image_rect.height - adjusted_height + 1
+      image_rect.y = by
+      image_rect.height = adjusted_height
+    return image_rect
+
+
 def build_displays(config: Configuration):
   displays = {}
   for m in screeninfo.get_monitors():
@@ -106,7 +337,6 @@ def build_displays(config: Configuration):
 
 
 def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
-
   setup_initial_positions(config, displays)
   adjust_horizontal_positions(displays)
   adjust_vertical_positions(displays)
@@ -119,8 +349,8 @@ def setup_initial_positions(config, displays):
     if config is not None:
       display.mm_offset_x = int(config.get(display.name, 'offsetX', fallback='0'))
       display.mm_offset_y = int(config.get(display.name, 'offsetY', fallback='0'))
-      display.mm_offset_x_from = config.get(display.name, 'offsetXFrom', fallback=None)
-      display.mm_offset_y_from = config.get(display.name, 'offsetYFrom', fallback=None)
+      display.offset_x_from = config.get(display.name, 'offsetXFrom', fallback=None)
+      display.offset_y_from = config.get(display.name, 'offsetYFrom', fallback=None)
 
     if display.offset_x_from == ZERO:
       display.mm_x = display.mm_offset_x
@@ -130,6 +360,9 @@ def setup_initial_positions(config, displays):
         display.offset_x_from = find_display_left(display, displays)
       if display.offset_x_from is None:
         display.mm_x = display.mm_offset_x
+      else:
+        ref_display: DisplayInfo = displays[display.offset_x_from]
+        display.mm_x = ref_display.mm_x + ref_display.mm_width + display.mm_offset_x
 
     if display.offset_y_from == ZERO:
       display.mm_y = display.mm_offset_x
@@ -139,6 +372,9 @@ def setup_initial_positions(config, displays):
         display.offset_y_from = find_display_above(display, displays)
       if display.offset_y_from is None:
         display.mm_y = display.mm_offset_y
+      else:
+        ref_display: DisplayInfo = displays[display.offset_y_from]
+        display.mm_y = ref_display.mm_x + ref_display.mm_height + display.mm_offset_y
 
 
 def adjust_horizontal_positions(displays):
@@ -153,7 +389,7 @@ def adjust_horizontal_positions(displays):
     elem = display_queue.pop(0)
     display = displays[elem]
     if display.offset_x_from in visits:
-      adjust_horz_position(display, displays)
+      adjust_horizontal(display, displays)
       visits.append(elem)
     else:
       display_queue.append(elem)
@@ -171,7 +407,7 @@ def adjust_vertical_positions(displays):
     elem = display_queue.pop(0)
     display = displays[elem]
     if display.offset_y_from in visits:
-      adjust_vert_position(display, displays)
+      adjust_vertical(display, displays)
       visits.append(elem)
     else:
       display_queue.append(elem)
@@ -214,248 +450,28 @@ def find_display_above(display: DisplayInfo, displays: {str: DisplayInfo}):
   return None
 
 
-def adjust_horz_position(display: DisplayInfo, displays: {str: DisplayInfo}):
+def adjust_horizontal(display: DisplayInfo, displays: {str: DisplayInfo}):
   next_name = display.offset_x_from
   if next_name is None:  # avoid recursive
     if display.mm_x is None:
       display.mm_x = display.mm_offset_x
   else:
     next_display = displays[next_name]
-    ref_point = adjust_horz_position(next_display, displays)
+    ref_point = adjust_horizontal(next_display, displays)
     display.mm_x = display.mm_offset_x + ref_point
   return display.mm_x + display.mm_width
 
 
-def adjust_vert_position(display: DisplayInfo, displays: {str: DisplayInfo}):
+def adjust_vertical(display: DisplayInfo, displays: {str: DisplayInfo}):
   next_name = display.offset_y_from
   if next_name is None:  # avoid recursive
     if display.mm_y is None:
       display.mm_y = display.mm_offset_y
   else:
     next_display = displays[next_name]
-    ref_point = adjust_vert_position(next_display, displays)
+    ref_point = adjust_vertical(next_display, displays)
     display.mm_y = display.mm_offset_y + ref_point
   return display.mm_y + display.mm_height
-
-
-@dataclass
-class Rect:
-  x: int | float
-  y: int | float
-  width: int | float
-  height: int | float
-
-  def size(self):
-    return int(round(self.width)), int(round(self.height))
-
-  def position(self):
-    return self.x, self.y
-
-  def box(self):
-    return int(round(self.x)), int(round(self.y)), \
-           int(round(self.x + self.width)), int(round(self.y + self.height))
-
-  def copy(self):
-    return Rect(self.x, self.y, self.width, self.height)
-
-  def __init__(self, x: int | float, y: int | float, width: int | float, height: int | float):
-    self.x = x
-    self.y = y
-    self.width = width
-    self.height = height
-
-  def vh_ratio(self):
-    return float(self.height) / self.width
-
-  def center(self):
-    return self.x + self.width / 2, self.y + self.height / 2
-
-  def shrink(self, n=1):
-    return Rect(self.x + n, self.y + n, self.width - n * 2, self.height - n * 2)
-
-  def grow(self, n=1):
-    return Rect(self.x - n, self.y - n, self.width + n * 2, self.height + n * 2)
-
-  @staticmethod
-  def of(image: Image):
-    return Rect(0, 0, image.width, image.height)
-
-  @staticmethod
-  def of_tuple(values: ()):
-    if values is None:
-      return Rect(0, 0, 0, 0)
-    if len(values) == 2:
-      return Rect(0, 0, float(values[0]), float(values[1]))
-    elif len(values) >= 4:
-      x0 = float(values[0])
-      y0 = float(values[1])
-      x1 = float(values[2])
-      y1 = float(values[3])
-      return Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
-    return Rect(0, 0, 0, 0)
-
-
-@dataclass
-class Canvas:
-  displays: {str: DisplayInfo}
-  __display_width: int
-  __display_height: int
-  __canvas_rect: Rect = None
-  __canvas_ratio: float = 1.0
-  __image_size: Rect = None
-  __fit_rect: Rect = None
-  __image: Image = None
-  __padding: bool = False
-  __crop: float = 0.0
-  __trim: bool = False
-
-  def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
-    assert displays is not None
-    mm_width = max([m.mm_x + m.mm_width for m in displays.values()])
-    mm_height = max([m.mm_y + m.mm_height for m in displays.values()])
-    display_width = max([m.width + m.x for m in displays.values()])
-    display_height = max([m.height + m.y for m in displays.values()])
-    self.displays = displays
-    self.__display_width = display_width
-    self.__display_height = display_height
-    self.__canvas_rect = Rect(0, 0, mm_width, mm_height)
-    self.__canvas_ratio = self.__canvas_rect.vh_ratio()
-    if config is not None:
-      self.__padding = config.padding
-      self.__crop = config.crop
-      self.__trim = config.trim
-
-  def display_size(self):
-    return self.__display_width, self.__display_height
-
-  def set_image(self, image: Image):
-    self.__prepare_image(image)
-
-  def get_image(self):
-    return self.__image
-
-  def paint(self) -> Image:
-    target = Image.new('RGB', self.display_size(), 'black')
-    if self.__image is None:
-      return target
-
-    assert self.__fit_rect is not None
-    fit_rect = self.__fit_rect
-    source_image = self.__image
-
-    ratio = fit_rect.width / self.__canvas_rect.width
-    logging.debug('image_rect: %s', str(self.__image_size))
-    logging.debug('fit_rect: %s', str(fit_rect))
-    logging.debug('canvas_rect: %s', str(self.__canvas_rect))
-    for display in self.displays.values():
-      source_rect = Canvas.__compute_source_rect(ratio, fit_rect, display)
-      logging.debug('display: %s', str(display))
-      logging.debug('source_rect: %s', str(source_rect))
-      source_img = source_image.crop(source_rect.box())
-      display_rect = display.rect()
-      source_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
-      target.paste(source_img, display_rect.position())
-
-    return target
-
-  def __prepare_image(self, image):
-    image_rect = Rect.of(image)
-    image_ratio = image_rect.vh_ratio()
-    if self.__canvas_ratio == image_ratio:
-      self.__image = image
-      self.__image_size = image_rect
-      self.__fit_rect = image_rect
-      return
-    (adjusted_image, fit_rect) = self.__adjust_image(image, image_ratio)
-    self.__image = adjusted_image
-    self.__image_size = Rect.of(adjusted_image)
-    self.__fit_rect = fit_rect
-
-  def __adjust_image(self, image: Image, image_ratio: float) -> (Image, Rect):
-    cropped = Canvas.__crop_image(image, self.__crop, image_ratio, self.__canvas_ratio, self.__trim)
-    image_rect = Rect.of(cropped)
-    _image_ratio = image_rect.vh_ratio()
-    if self.__canvas_ratio < _image_ratio:
-      image_rect.height = cropped.width * self.__canvas_ratio
-      image_rect.y = (cropped.height - image_rect.height) * 0.5
-    else:
-      image_rect.width = cropped.height / self.__canvas_ratio
-      image_rect.x = (cropped.width - image_rect.width) * 0.5
-
-    if self.__padding:
-      padded = Canvas.__pad_image(cropped, image_rect, _image_ratio, self.__canvas_ratio)
-      return padded, Rect.of(padded)
-    return cropped, image_rect
-
-  @staticmethod
-  def __compute_source_rect(ratio: float, fit_rect: Rect, display: DisplayInfo) -> Rect:
-    x = ratio * display.mm_x + fit_rect.x
-    y = ratio * display.mm_y + fit_rect.y
-    width = ratio * display.mm_width
-    height = ratio * display.mm_height
-    return Rect(x, y, width, height)
-
-  @staticmethod
-  def __pad_image(image: Image, pad_rect: Rect, image_ratio: float, canvas_ratio: float) -> Image:
-    image_rect = Rect.of(image)
-    from PIL import ImageFilter
-    source = image.filter(ImageFilter.BoxBlur(radius=16))
-    x = 0
-    y = 0
-    if image_ratio > canvas_ratio:
-      adjusted_width = image_rect.height / canvas_ratio
-      x = round((adjusted_width - image_rect.width) * 0.5)
-      image_rect.width = int(round(adjusted_width))
-    else:
-      adjusted_height = image_rect.width * canvas_ratio
-      y = round((adjusted_height - image_rect.height) * 0.5)
-      image_rect.height = int(round(adjusted_height))
-    target = source.resize(image_rect.size(), Image.Resampling.BILINEAR, pad_rect.box())
-    target.paste(image, (x, y))
-    return target
-
-  @staticmethod
-  def __crop_image(
-      image: Image, crop_pct: float, image_ratio: float, canvas_ratio: float, trim: bool) -> Image:
-    if crop_pct == 0.0 or image_ratio == canvas_ratio:
-      return image
-    is_wider = image_ratio < canvas_ratio
-    crop = (100.0 - crop_pct) * 0.01
-    feature_box = Canvas.__find_edges(image, crop, is_wider, trim)
-    target = image.crop(feature_box.box())
-    return target
-
-  @staticmethod
-  def __find_edges(image: Image, crop: float, is_wider: bool, trim: bool) -> Rect:
-    image_rect = Rect.of(image)
-    box_rect: Rect
-    if trim:
-      img = image.convert('L').filter(ImageFilter.BoxBlur(radius=5))
-      edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 1.0, -30))
-      edge = edge.crop(image_rect.shrink().box())
-      box = Image.Image.getbbox(edge)
-      box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
-    else:
-      box_rect = image_rect.copy()
-    (cx, cy) = image_rect.center()
-    (bx, by) = box_rect.center()
-    if is_wider:
-      adjusted_width = int(round(image_rect.width * crop))
-      c_crop = cx * crop
-      bx = max(int(round(bx - c_crop)), 0)
-      if bx + adjusted_width > image_rect.width:
-        bx = image_rect.width - adjusted_width - 1
-      image_rect.x = bx
-      image_rect.width = adjusted_width
-    else:
-      adjusted_height = int(round(image_rect.height * crop))
-      c_crop = cy * crop
-      by = max(int(round(by - c_crop)), 0)
-      if by + adjusted_height > image_rect.height:
-        by = image_rect.height - adjusted_height + 1
-      image_rect.y = by
-      image_rect.height = adjusted_height
-    return image_rect
 
 
 # from tensorboard's util.py
