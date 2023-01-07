@@ -337,20 +337,24 @@ def build_displays(config: Configuration):
 
 
 def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
-  setup_initial_positions(config, displays)
+  setup_horizontal_positions(config, displays)
+  setup_vertical_positions(config, displays)
   adjust_horizontal_positions(displays)
   adjust_vertical_positions(displays)
   normalize_positions(displays)
   return displays
 
 
-def setup_initial_positions(config, displays):
-  for display in displays.values():
+def get_display_x(display: DisplayInfo):
+  return display.x
+
+
+def setup_horizontal_positions(config, displays):
+  sorted_list = sorted(displays.values(), key=get_display_x)
+  for display in sorted_list:
     if config is not None:
       display.mm_offset_x = int(config.get(display.name, 'offsetX', fallback='0'))
-      display.mm_offset_y = int(config.get(display.name, 'offsetY', fallback='0'))
       display.offset_x_from = config.get(display.name, 'offsetXFrom', fallback=None)
-      display.offset_y_from = config.get(display.name, 'offsetYFrom', fallback=None)
 
     if display.offset_x_from == ZERO:
       display.mm_x = display.mm_offset_x
@@ -363,6 +367,18 @@ def setup_initial_positions(config, displays):
       else:
         ref_display: DisplayInfo = displays[display.offset_x_from]
         display.mm_x = ref_display.mm_x + ref_display.mm_width + display.mm_offset_x
+
+
+def get_display_y(display: DisplayInfo):
+  return display.y
+
+
+def setup_vertical_positions(config, displays):
+  sorted_list = sorted(displays.values(), key=get_display_y)
+  for display in sorted_list:
+    if config is not None:
+      display.mm_offset_y = int(config.get(display.name, 'offsetY', fallback='0'))
+      display.offset_y_from = config.get(display.name, 'offsetYFrom', fallback=None)
 
     if display.offset_y_from == ZERO:
       display.mm_y = display.mm_offset_x
@@ -429,7 +445,8 @@ def find_display_left(display: DisplayInfo, displays: {str: DisplayInfo}):
         and ref.x < display.x:
       delta_x = ref.x + ref.width - display.x
       delta_y = ref.y - display.y
-      candidates[ref.name] = delta_x * delta_x + delta_y + delta_y
+      candidates[ref.name] = delta_x * delta_x + delta_y * delta_y
+      # candidates[ref.name] = delta_x * delta_x
   if candidates:
     sorted_list = sorted((value, key) for (key, value) in candidates.items())
     return sorted_list[0][1]
@@ -443,7 +460,8 @@ def find_display_above(display: DisplayInfo, displays: {str: DisplayInfo}):
         and ref.y < display.y:
       delta_x = ref.x - display.x
       delta_y = ref.y + ref.height - display.y
-      candidates[ref.name] = delta_x * delta_x + delta_y + delta_y
+      candidates[ref.name] = delta_x * delta_x + delta_y * delta_y
+      # candidates[ref.name] = delta_y * delta_y
   if candidates:
     sorted_list = sorted((value, key) for (key, value) in candidates.items())
     return sorted_list[0][1]
