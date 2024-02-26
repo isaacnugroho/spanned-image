@@ -7,7 +7,8 @@ from spanned_image import DisplayInfo, normalize_displays, find_display_left
 
 
 class Test(TestCase):
-  def test_find_adjacent_monitor_h(self):
+  @staticmethod
+  def test_find_adjacent_monitor_h():
     monitors = {
         'a': DisplayInfo(
             Monitor(name='a', x=0, y=0, width=800, height=600, width_mm=8000, height_mm=6000)),
@@ -28,7 +29,8 @@ class Test(TestCase):
     print(left_of_c)
     assert left_of_c is None
 
-  def test_normalize_monitors(self):
+  @staticmethod
+  def test_normalize_monitors():
     monitors = {
         'a': DisplayInfo(
             Monitor(name='a', x=0, y=0, width=800, height=600, width_mm=8000, height_mm=6000)),
