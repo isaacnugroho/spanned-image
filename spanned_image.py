@@ -116,16 +116,24 @@ class DisplayInfo:
   y: int
   width: int
   height: int
+  name: str = None
   mm_offset_x: int = 0
   mm_offset_y: int = 0
-  name: str = None
-  mm_x: float = None
-  mm_y: float = None
+  mm_x: float = 0.0
+  mm_y: float = 0.0
   mm_width: float = None
   mm_height: float = None
   is_primary: bool = None
   offset_x_from: str = None
   offset_y_from: str = None
+  x_reference: str = None
+  x_reference_mode: str = None
+  x_reference_offset: int = 0
+  x_reference_offset_mm: float = 0.0
+  y_reference: str = None
+  y_reference_mode: str = None
+  y_reference_offset: int = 0
+  y_reference_offset_mm: float = 0.0
 
   def __init__(self, monitor: Monitor, mm_offset_x: int = 0, mm_offset_y: int = 0):
     assert monitor is not None
@@ -136,16 +144,24 @@ class DisplayInfo:
     self.mm_offset_y = mm_offset_y
     self.width = monitor.width
     self.height = monitor.height
-    self.is_primary = (monitor.is_primary is not None and monitor.is_primary)
+    self.is_primary = (monitor.is_primary == True)
     self.name = monitor.name
-    if monitor.width_mm is None:
-      self.mm_width = monitor.width / DEFAULT_DOT_PER_MM
+    if monitor.width_mm:
+      mm_width = monitor.width_mm
     else:
-      self.mm_width = float(monitor.width_mm)
-    if monitor.height_mm is None:
-      self.mm_height = monitor.height / DEFAULT_DOT_PER_MM
+      mm_width = monitor.width / DEFAULT_DOT_PER_MM
+    if monitor.height_mm:
+      mm_height = monitor.height_mm
     else:
-      self.mm_height = float(monitor.height_mm)
+      mm_height = monitor.height / DEFAULT_DOT_PER_MM
+
+    # swap if rotated
+    if (monitor.width < monitor.height) == (mm_width < mm_height):
+      self.mm_width = float(mm_width)
+      self.mm_height = float(mm_height)
+    else:
+      self.mm_width = float(mm_height)
+      self.mm_height = float(mm_width)
 
   def rect(self):
     return Rect(self.x, self.y, self.width, self.height)
@@ -337,159 +353,211 @@ def build_displays(config: Configuration):
 
 
 def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
-  setup_horizontal_positions(config, displays)
-  setup_vertical_positions(config, displays)
-  adjust_horizontal_positions(displays)
-  adjust_vertical_positions(displays)
+  for display in displays.values():
+    logging.debug('display initial: %s', str(display))
+  h_sort = sorted(displays.values(), key=get_display_x)
+  v_sort = sorted(displays.values(), key=get_display_y)
+  init_horizontal_references(config, displays, h_sort)
+  init_vertical_references(config, displays, v_sort)
+  for display in displays.values():
+    logging.debug('display after setup: %s', str(display))
   normalize_positions(displays)
+  for display in displays.values():
+    logging.debug('display after adjust: %s', str(display))
   return displays
 
 
-def get_display_x(display: DisplayInfo):
-  return display.x
+def init_horizontal_references(config, displays: {str: DisplayInfo}, h_sorted_list):
+  n = len(h_sorted_list)
+  i = 1
+  while i < n:
+    display = h_sorted_list[i]
+    read_horz_offset_from_config(config, display, displays)
+    find_horz_relation(display, h_sorted_list, i)
+    if display.x_reference_mode == 'ABS':
+      display.mm_x = display.x_reference_offset_mm
+    elif display.x_reference_mode == 'F2F':
+      ref = displays[display.x_reference]
+      display.mm_x = ref.mm_x + ref.mm_width - display.mm_width + display.x_reference_offset_mm
+    elif display.x_reference_mode == 'S2S':
+      ref = displays[display.x_reference]
+      display.mm_x = ref.mm_x + display.x_reference_offset_mm
+    elif display.x_reference_mode == 'F2S':
+      ref = displays[display.x_reference]
+      display.mm_x = ref.mm_x + ref.mm_width + display.x_reference_offset_mm
+    i += 1
 
 
-def setup_horizontal_positions(config, displays):
-  sorted_list = sorted(displays.values(), key=get_display_x)
-  for display in sorted_list:
-    if config is not None:
-      display.mm_offset_x = int(config.get(display.name, 'offsetX', fallback='0'))
-      display.offset_x_from = config.get(display.name, 'offsetXFrom', fallback=None)
-
-    if display.offset_x_from == ZERO:
-      display.mm_x = display.mm_offset_x
+def read_horz_offset_from_config(config, display, displays):
+  if display.x_reference_mode:
+    return
+  if config and config.get(display.name, 'offsetXFrom', fallback=None):
+    ref_name: str = config.get(display.name, 'offsetXFrom', fallback=None)
+    if ref_name == ZERO:
+      display.x_reference_mode = 'ABS'
+      display.x_reference_offset = display.x
+      display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
       display.offset_x_from = None
     else:
-      if display.offset_x_from is None or display.offset_x_from not in displays.keys():
-        display.offset_x_from = find_display_left(display, displays)
-      if display.offset_x_from is None:
-        display.mm_x = display.mm_offset_x
-      else:
-        ref_display: DisplayInfo = displays[display.offset_x_from]
-        display.mm_x = ref_display.mm_x + ref_display.mm_width + display.mm_offset_x
+      ref: DisplayInfo = displays[ref_name]
+      if ref:
+        display.x_reference = ref_name
+        display.x_reference_mode = config.get(display.name, 'offsetXMode', fallback='S2S')
+        display.x_reference_offset = display.x - (ref.x + ref.width)
+        display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
+        display.offset_x_from = ref_name
+
+
+def find_horz_relation(display, h_sorted_list, i):
+  if display.x_reference_mode:
+    return
+  j = 0
+  while j < i:
+    ref: DisplayInfo = h_sorted_list[j]
+    if display.x == ref.x + ref.width:
+      display.x_reference = ref.name
+      display.x_reference_mode = 'F2S'
+      break
+    elif display.x == ref.x:
+      display.x_reference = ref.name
+      display.x_reference_mode = 'S2S'
+      break
+    elif display.x + display.width == ref.x + ref.width:
+      display.x_reference = ref.name
+      display.x_reference_mode = 'F2F'
+      break
+    j += 1
+  if not display.x_reference_mode:
+    ref: DisplayInfo = find_display_left(display, h_sorted_list)
+    if ref:
+      display.x_reference = ref.name
+      display.x_reference_mode = 'F2S'
+      display.x_reference_offset = display.y - (ref.x + ref.width)
+
+
+def init_vertical_references(config, displays: {str: DisplayInfo}, v_sorted_list):
+  n = len(v_sorted_list)
+  i = 1
+  while i < n:
+    display = v_sorted_list[i]
+    read_vert_offset_from_config(config, display, displays)
+    find_vert_relation(display, v_sorted_list, i)
+    if display.y_reference_mode == 'ABS':
+      display.mm_y = display.y_reference_offset_mm
+    elif display.y_reference_mode == 'F2F':
+      ref = displays[display.y_reference]
+      display.mm_y = ref.mm_y + ref.mm_height - display.mm_height + display.y_reference_offset_mm
+    elif display.y_reference_mode == 'S2S':
+      ref = displays[display.y_reference]
+      display.mm_y = ref.mm_y + display.y_reference_offset_mm
+    elif display.y_reference_mode == 'F2S':
+      ref = displays[display.y_reference]
+      display.mm_y = ref.mm_y + ref.mm_height + display.y_reference_offset_mm
+    i += 1
+
+
+def read_vert_offset_from_config(config, display, displays):
+  if display.y_reference_mode:
+    return
+  if config and config.get(display.name, 'offsetYFrom', fallback=None):
+    ref_name: str = config.get(display.name, 'offsetYFrom', fallback=None)
+    if ref_name == ZERO:
+      display.y_reference_mode = 'ABS'
+      display.y_reference_offset = display.y
+      display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
+      display.offset_y_from = None
+    else:
+      ref: DisplayInfo = displays[ref_name]
+      if ref:
+        display.y_reference = ref_name
+        display.y_reference_mode = config.get(display.name, 'offsetYMode', fallback='S2S')
+        display.y_reference_offset = display.y - (ref.y + ref.height)
+        display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
+        display.offset_y_from = ref_name
+
+
+def find_vert_relation(display, v_sorted_list, i):
+  if display.y_reference_mode:
+    return
+  j = 0
+  while j < i:
+    ref: DisplayInfo = v_sorted_list[j]
+    if display.y == ref.y + ref.height:
+      display.y_reference = ref.name
+      display.y_reference_mode = 'F2S'
+      break
+    elif display.y == ref.y:
+      display.y_reference = ref.name
+      display.y_reference_mode = 'S2S'
+      break
+    elif display.y + display.height == ref.y + ref.height:
+      display.y_reference = ref.name
+      display.y_reference_mode = 'F2F'
+      break
+    j += 1
+  if not display.y_reference_mode:
+    ref: DisplayInfo = find_display_above(display, v_sorted_list)
+    if ref:
+      display.y_reference = ref.name
+      display.y_reference_mode = 'F2S'
+      display.y_reference_offset = display.y - (ref.y + ref.height)
+
+
+def get_display_x(display: DisplayInfo):
+  v = display.x * 32768 + display.y
+  if not display.is_primary:
+    v += 16384
+  return v
 
 
 def get_display_y(display: DisplayInfo):
-  return display.y
-
-
-def setup_vertical_positions(config, displays):
-  sorted_list = sorted(displays.values(), key=get_display_y)
-  for display in sorted_list:
-    if config is not None:
-      display.mm_offset_y = int(config.get(display.name, 'offsetY', fallback='0'))
-      display.offset_y_from = config.get(display.name, 'offsetYFrom', fallback=None)
-
-    if display.offset_y_from == ZERO:
-      display.mm_y = display.mm_offset_x
-      display.offset_y_from = None
-    else:
-      if display.offset_y_from is None or display.offset_y_from not in displays.keys():
-        display.offset_y_from = find_display_above(display, displays)
-      if display.offset_y_from is None:
-        display.mm_y = display.mm_offset_y
-      else:
-        ref_display: DisplayInfo = displays[display.offset_y_from]
-        display.mm_y = ref_display.mm_x + ref_display.mm_height + display.mm_offset_y
-
-
-def adjust_horizontal_positions(displays):
-  visits: {str} = []
-  display_queue: [str] = []
-  for display in displays.values():
-    if display.offset_x_from is None:
-      visits.append(display.name)
-    else:
-      display_queue.append(display.name)
-  while len(display_queue) > 0:
-    elem = display_queue.pop(0)
-    display = displays[elem]
-    if display.offset_x_from in visits:
-      adjust_horizontal(display, displays)
-      visits.append(elem)
-    else:
-      display_queue.append(elem)
-
-
-def adjust_vertical_positions(displays):
-  visits: {str} = []
-  display_queue: [str] = []
-  for display in displays.values():
-    if display.offset_y_from is None:
-      visits.append(display.name)
-    else:
-      display_queue.append(display.name)
-  while len(display_queue) > 0:
-    elem = display_queue.pop(0)
-    display = displays[elem]
-    if display.offset_y_from in visits:
-      adjust_vertical(display, displays)
-      visits.append(elem)
-    else:
-      display_queue.append(elem)
+  v = display.y * 32768 + display.x
+  if not display.is_primary:
+    v += 16384
+  return v
 
 
 def normalize_positions(displays):
   mm_origin_x = min([m.mm_x for m in displays.values()])
   mm_origin_y = min([m.mm_y for m in displays.values()])
-  if mm_origin_y < 0 or mm_origin_x < 0:
+  if mm_origin_y != 0 or mm_origin_x != 0:
     for display in displays.values():
       display.mm_x -= mm_origin_x
       display.mm_y -= mm_origin_y
 
 
-def find_display_left(display: DisplayInfo, displays: {str: DisplayInfo}):
+def find_display_left(display: DisplayInfo, display_list: [DisplayInfo]):
   candidates = {}
-  for ref in displays.values():
-    if ref.name != display.name \
-        and ref.x < display.x:
+  i = 0
+  while i < len(display_list):
+    ref = display_list[i]
+    if ref.name != display.name and ref.x < display.x:
       delta_x = ref.x + ref.width - display.x
       delta_y = ref.y - display.y
-      candidates[ref.name] = delta_x * delta_x + delta_y * delta_y
-      # candidates[ref.name] = delta_x * delta_x
+      candidates[i] = delta_x * delta_x + delta_y * delta_y
+    i += 1
   if candidates:
     sorted_list = sorted((value, key) for (key, value) in candidates.items())
-    return sorted_list[0][1]
+    ref = display_list[sorted_list[0][1]]
+    return ref
   return None
 
 
-def find_display_above(display: DisplayInfo, displays: {str: DisplayInfo}):
+def find_display_above(display: DisplayInfo, display_list: [DisplayInfo]):
   candidates = {}
-  for ref in displays.values():
-    if ref.name != display.name \
-        and ref.y < display.y:
+  i = 0
+  while i < len(display_list):
+    ref = display_list[i]
+    if ref.name != display.name and ref.y < display.y:
       delta_x = ref.x - display.x
       delta_y = ref.y + ref.height - display.y
-      candidates[ref.name] = delta_x * delta_x + delta_y * delta_y
-      # candidates[ref.name] = delta_y * delta_y
+      candidates[i] = delta_x * delta_x + delta_y * delta_y
+    i += 1
   if candidates:
     sorted_list = sorted((value, key) for (key, value) in candidates.items())
-    return sorted_list[0][1]
+    ref = display_list[sorted_list[0][1]]
+    return ref
   return None
-
-
-def adjust_horizontal(display: DisplayInfo, displays: {str: DisplayInfo}):
-  next_name = display.offset_x_from
-  if next_name is None:  # avoid recursive
-    if display.mm_x is None:
-      display.mm_x = display.mm_offset_x
-  else:
-    next_display = displays[next_name]
-    ref_point = adjust_horizontal(next_display, displays)
-    display.mm_x = display.mm_offset_x + ref_point
-  return display.mm_x + display.mm_width
-
-
-def adjust_vertical(display: DisplayInfo, displays: {str: DisplayInfo}):
-  next_name = display.offset_y_from
-  if next_name is None:  # avoid recursive
-    if display.mm_y is None:
-      display.mm_y = display.mm_offset_y
-  else:
-    next_display = displays[next_name]
-    ref_point = adjust_vertical(next_display, displays)
-    display.mm_y = display.mm_offset_y + ref_point
-  return display.mm_y + display.mm_height
 
 
 # from tensorboard's util.py
@@ -535,6 +603,9 @@ def spanned_image(config, input_file, output_file):
   logging.debug('saving image: %s', output_file)
   try:
     result.save(output_file)
+    config = Configuration()
+    if config.debug:
+      result.save('/tmp/spanned-image.png')
   except Exception as e:
     logging.error("saving writing %s with error %s", output_file, e)
 
