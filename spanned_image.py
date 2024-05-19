@@ -117,31 +117,25 @@ class DisplayInfo:
   width: int
   height: int
   name: str = None
-  mm_offset_x: int = 0
-  mm_offset_y: int = 0
   mm_x: float = 0.0
   mm_y: float = 0.0
   mm_width: float = None
   mm_height: float = None
   is_primary: bool = None
-  offset_x_from: str = None
-  offset_y_from: str = None
   x_reference: str = None
   x_reference_mode: str = None
-  x_reference_offset: int = 0
   x_reference_offset_mm: float = 0.0
   y_reference: str = None
   y_reference_mode: str = None
-  y_reference_offset: int = 0
   y_reference_offset_mm: float = 0.0
+  x_ref_count: int = 0
+  y_ref_count: int = 0
 
-  def __init__(self, monitor: Monitor, mm_offset_x: int = 0, mm_offset_y: int = 0):
+  def __init__(self, monitor: Monitor):
     assert monitor is not None
     assert monitor.name is not None
     self.x = monitor.x
     self.y = monitor.y
-    self.mm_offset_x = mm_offset_x
-    self.mm_offset_y = mm_offset_y
     self.width = monitor.width
     self.height = monitor.height
     self.is_primary = (monitor.is_primary == True)
@@ -349,30 +343,31 @@ def build_displays(config: Configuration):
   for m in screeninfo.get_monitors():
     display = DisplayInfo(m)
     displays[m.name] = display
-  return normalize_displays(displays, config)
+
+  for display in displays.values():
+    read_horz_offset_from_config(config, display, displays)
+    read_vert_offset_from_config(config, display, displays)
+  return normalize_displays(displays)
 
 
-def normalize_displays(displays: {str: DisplayInfo}, config: Configuration):
+def normalize_displays(displays: {str: DisplayInfo}):
   for display in displays.values():
     logging.debug('display initial: %s', str(display))
   h_sort = sorted(displays.values(), key=get_display_x)
   v_sort = sorted(displays.values(), key=get_display_y)
-  init_horizontal_references(config, displays, h_sort)
-  init_vertical_references(config, displays, v_sort)
-  for display in displays.values():
-    logging.debug('display after setup: %s', str(display))
+  init_horizontal_references(displays, h_sort)
+  init_vertical_references(displays, v_sort)
   normalize_positions(displays)
   for display in displays.values():
     logging.debug('display after adjust: %s', str(display))
   return displays
 
 
-def init_horizontal_references(config, displays: {str: DisplayInfo}, h_sorted_list):
+def init_horizontal_references(displays: {str: DisplayInfo}, h_sorted_list):
   n = len(h_sorted_list)
-  i = 1
+  i = 0
   while i < n:
     display = h_sorted_list[i]
-    read_horz_offset_from_config(config, display, displays)
     find_horz_relation(display, h_sorted_list, i)
     if display.x_reference_mode == 'ABS':
       display.mm_x = display.x_reference_offset_mm
@@ -389,23 +384,19 @@ def init_horizontal_references(config, displays: {str: DisplayInfo}, h_sorted_li
 
 
 def read_horz_offset_from_config(config, display, displays):
-  if display.x_reference_mode:
-    return
+
   if config and config.get(display.name, 'offsetXFrom', fallback=None):
     ref_name: str = config.get(display.name, 'offsetXFrom', fallback=None)
     if ref_name == ZERO:
       display.x_reference_mode = 'ABS'
-      display.x_reference_offset = display.x
       display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
-      display.offset_x_from = None
     else:
       ref: DisplayInfo = displays[ref_name]
       if ref:
         display.x_reference = ref_name
         display.x_reference_mode = config.get(display.name, 'offsetXMode', fallback='S2S')
-        display.x_reference_offset = display.x - (ref.x + ref.width)
         display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
-        display.offset_x_from = ref_name
+        ref.x_ref_count += 1
 
 
 def find_horz_relation(display, h_sorted_list, i):
@@ -417,14 +408,17 @@ def find_horz_relation(display, h_sorted_list, i):
     if display.x == ref.x + ref.width:
       display.x_reference = ref.name
       display.x_reference_mode = 'F2S'
+      ref.x_ref_count += 1
       break
     elif display.x == ref.x:
       display.x_reference = ref.name
       display.x_reference_mode = 'S2S'
+      ref.x_ref_count += 1
       break
     elif display.x + display.width == ref.x + ref.width:
       display.x_reference = ref.name
       display.x_reference_mode = 'F2F'
+      ref.x_ref_count += 1
       break
     j += 1
   if not display.x_reference_mode:
@@ -432,15 +426,14 @@ def find_horz_relation(display, h_sorted_list, i):
     if ref:
       display.x_reference = ref.name
       display.x_reference_mode = 'F2S'
-      display.x_reference_offset = display.y - (ref.x + ref.width)
+      ref.x_ref_count += 1
 
 
-def init_vertical_references(config, displays: {str: DisplayInfo}, v_sorted_list):
+def init_vertical_references(displays: {str: DisplayInfo}, v_sorted_list):
   n = len(v_sorted_list)
-  i = 1
+  i = 0
   while i < n:
     display = v_sorted_list[i]
-    read_vert_offset_from_config(config, display, displays)
     find_vert_relation(display, v_sorted_list, i)
     if display.y_reference_mode == 'ABS':
       display.mm_y = display.y_reference_offset_mm
@@ -457,23 +450,18 @@ def init_vertical_references(config, displays: {str: DisplayInfo}, v_sorted_list
 
 
 def read_vert_offset_from_config(config, display, displays):
-  if display.y_reference_mode:
-    return
   if config and config.get(display.name, 'offsetYFrom', fallback=None):
     ref_name: str = config.get(display.name, 'offsetYFrom', fallback=None)
     if ref_name == ZERO:
       display.y_reference_mode = 'ABS'
-      display.y_reference_offset = display.y
       display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
-      display.offset_y_from = None
     else:
       ref: DisplayInfo = displays[ref_name]
       if ref:
         display.y_reference = ref_name
         display.y_reference_mode = config.get(display.name, 'offsetYMode', fallback='S2S')
-        display.y_reference_offset = display.y - (ref.y + ref.height)
         display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
-        display.offset_y_from = ref_name
+        ref.y_ref_count += 1
 
 
 def find_vert_relation(display, v_sorted_list, i):
@@ -485,14 +473,17 @@ def find_vert_relation(display, v_sorted_list, i):
     if display.y == ref.y + ref.height:
       display.y_reference = ref.name
       display.y_reference_mode = 'F2S'
+      ref.y_ref_count += 1
       break
     elif display.y == ref.y:
       display.y_reference = ref.name
       display.y_reference_mode = 'S2S'
+      ref.y_ref_count += 1
       break
     elif display.y + display.height == ref.y + ref.height:
       display.y_reference = ref.name
       display.y_reference_mode = 'F2F'
+      ref.y_ref_count += 1
       break
     j += 1
   if not display.y_reference_mode:
@@ -500,10 +491,13 @@ def find_vert_relation(display, v_sorted_list, i):
     if ref:
       display.y_reference = ref.name
       display.y_reference_mode = 'F2S'
-      display.y_reference_offset = display.y - (ref.y + ref.height)
+      ref.y_ref_count += 1
 
 
 def get_display_x(display: DisplayInfo):
+  if display.x_ref_count > 0:
+    v = -display.x_ref_count
+    return v
   v = display.x * 32768 + display.y
   if not display.is_primary:
     v += 16384
@@ -511,6 +505,9 @@ def get_display_x(display: DisplayInfo):
 
 
 def get_display_y(display: DisplayInfo):
+  if display.y_ref_count > 0:
+    v = -display.y_ref_count
+    return v
   v = display.y * 32768 + display.x
   if not display.is_primary:
     v += 16384
