@@ -1,2 +1,2 @@
 screeninfo~=0.8.1
-pillow~=10.3.0
+pillow~=11.1.0

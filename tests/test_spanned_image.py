@@ -3,7 +3,7 @@ from unittest import TestCase
 
 from screeninfo import Monitor
 
-from spanned_image import DisplayInfo, normalize_displays, find_display_left
+from src.spanned_image import DisplayInfo, normalize_displays, find_display_left
 
 
 class Test(TestCase):

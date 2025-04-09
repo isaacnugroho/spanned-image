@@ -1,0 +1,1 @@
+from .spanned_image import main

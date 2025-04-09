@@ -7,9 +7,9 @@ Compose wallpaper image for multi monitor setup by taking into account the monit
 
 ## How to Use
 Just run the script:
-`./spanned-image.sh source.png dest.png`
+`src/spanned-image.py source.png dest.png`
 
-### Customization
+### Configuration
 Say, you use dual monitors with layout aligned on top. 
 
 ```
@@ -31,16 +31,35 @@ But, actually the second monitor is lower by 3 cm and have distant 2 cm.
 |                  |  +---------------+ 
 +------------------+  
 ```
-The custom position can be set in spanned-image.conf with the following format
+The custom position can be set in spanned-image.ini with the following format
 ```
-CUSTOM_MONITORS=( "<monitor name> <x offset> <y offset>" )
+[Config]
+padding=False
+crop=0
+trim=False
+debug=False
+drawGrid=True
+
+[HDMI-0]
+offsetY=0
+offsetYFrom=Zero
+offsetYMode=S2S
+offsetX=0
+offsetXFrom=Zero
+offsetXMode=F2S
+
+[DP-4]
+offsetY=30
+offsetYFrom=Zero
+offsetYMode=S2S
+offsetX=20
+offsetXFrom=HDMI-0
+offsetXMode=F2S
 ```
-`x offset`: horizontal offset in mm
-`y offset`: vertical offset in mm below its virtual position
+Copy spanned-image.ini to ~/.config/ to be read by the script.
 
-And the setup for the above case is:
-`CUSTOM_MONITORS=( "DP-4 20 30" )`
+## TODOS
 
-Copy spanned-image.conf to ~/.config/ to be read by the script.
-
-Enjoy!
+* Caching computation to speed up things
+* Capability to have multiple layouts based on active monitors
+* 

@@ -390,7 +390,7 @@ def read_horz_offset_from_config(config, display, displays):
     if ref_name == ZERO:
       display.x_reference_mode = 'ABS'
       display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
-    else:
+    elif ref_name in displays.keys():
       ref: DisplayInfo = displays[ref_name]
       if ref:
         display.x_reference = ref_name
@@ -455,7 +455,7 @@ def read_vert_offset_from_config(config, display, displays):
     if ref_name == ZERO:
       display.y_reference_mode = 'ABS'
       display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
-    else:
+    elif ref_name in displays.keys():
       ref: DisplayInfo = displays[ref_name]
       if ref:
         display.y_reference = ref_name
