@@ -6,8 +6,10 @@ from PIL import Image, ImageFilter
 import sys
 import os
 import tomli
+import tomli_w
 import logging
 import tempfile
+import hashlib
 from typing import Optional, Dict, Any
 from enum import Enum
 
@@ -21,10 +23,18 @@ TEMP_DIR = tempfile.gettempdir()
 
 
 class ReferenceMode(Enum):
-  Absolute = 'ABS'
-  EndToEnd = 'F2F'
-  StartToEnd = 'S2S'
-  EndToStart = 'F2S'
+  Absolute = 'ABS' # absolute position
+  # end to end, use referenced display's right/bottom edge
+  # to compute offset of current display's left/top edge
+  EndToEnd = 'E2E'
+  # start to end, use referenced display's left/top edge
+  # to compute offset of current display's left/top edge
+  # (e.g. DP-4's left edge is referenced to DP-3's left edge)
+  StartToEnd = 'S2E' 
+  # end to start, use referenced display's right/bottom edge
+  # to compute offset of current display's left/top edge
+  # (e.g. DP-4's right edge is referenced to DP-3's right edge)  
+  EndToStart = 'E2S'
 
 
 @dataclass
@@ -67,8 +77,10 @@ class Configuration:
   def __init__(self):
     self.__config: Optional[Dict[str, Any]] = None
     self.__current_profile: str = 'profile1'
+    self.__config_file: Optional[str] = None
     _found_config = find_config_file()
     if _found_config is not None:
+      self.__config_file = _found_config
       with open(_found_config, 'rb') as f:
         self.__config = tomli.load(f)
       
@@ -84,6 +96,80 @@ class Configuration:
       self.debug = _debug.upper() in ['TRUE', 'ON']
       self.center = str(config_section.get('center', self.center))
       self.__current_profile = str(config_section.get('currentProfile', 'profile1'))
+    else:
+      # No config file found, create one with default values
+      self._create_default_config()
+
+  def _create_default_config(self):
+    """Create a config file with default values when no config file exists."""
+    # Determine where to create the config file (prefer user config directory)
+    _user_config_path = get_user_config_directory()
+    if _user_config_path is not None:
+      _user_config = os.path.join(_user_config_path, 'spanned-image.toml')
+      self.__config_file = _user_config
+    else:
+      _local_config = os.path.join(os.path.dirname(__file__), 'spanned-image.toml')
+      self.__config_file = _local_config
+    
+    # Initialize config with default values
+    self.__config = {
+      'Config': {
+        'currentProfile': self.__current_profile,
+        'padding': self.padding,
+        'trim': self.trim,
+        'crop': self.crop,
+        'debug': self.debug,
+        'center': self.center
+      }
+    }
+    # Write the default config file
+    self._write_config()
+
+  def set_current_profile(self, profile_name: str):
+    """Set the current profile and update the config file."""
+    self.__current_profile = profile_name
+    if self.__config is not None:
+      if 'Config' not in self.__config:
+        self.__config['Config'] = {}
+      self.__config['Config']['currentProfile'] = profile_name
+      self._write_config()
+
+  def _write_config(self):
+    """Write the config back to the file."""
+    if self.__config_file is not None and self.__config is not None:
+      try:
+        # Ensure Config section exists with currentProfile
+        if 'Config' not in self.__config:
+          self.__config['Config'] = {}
+        self.__config['Config']['currentProfile'] = self.__current_profile
+        # Ensure directory exists
+        config_dir = os.path.dirname(self.__config_file)
+        if config_dir and not os.path.exists(config_dir):
+          os.makedirs(config_dir, exist_ok=True)
+        with open(self.__config_file, 'wb') as f:
+          tomli_w.dump(self.__config, f)
+      except Exception as e:
+        logging.warning("Failed to write config file: %s", e)
+
+  def find_profile_by_hash(self, hash_value: str) -> Optional[str]:
+    """Find a profile section with matching hash_value. Returns profile name or None."""
+    if self.__config is None:
+      return None
+    for key, value in self.__config.items():
+      if key.startswith('profile_') and isinstance(value, dict):
+        if value.get('hashValue') == hash_value:
+          return key
+    return None
+
+  def create_profile(self, profile_name: str, monitor_data_str: str, monitor_names: list, hash_value: str):
+    """Create a new profile section with monitorData, monitors array, and hash_value."""
+    if self.__config is None:
+      self.__config = {}
+    self.__config[profile_name] = {
+      'monitorData': monitor_data_str,
+      'monitors': monitor_names,
+      'hashValue': hash_value
+    }
 
   def currentProfile(self, display_name: str) -> DisplayConfig:
     """Return DisplayConfig for the given display name based on the active profile.
@@ -249,10 +335,11 @@ class Canvas:
 
   def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
     assert displays is not None
-    mm_width = max([m.mm_x + m.mm_width for m in displays.values()])
-    mm_height = max([m.mm_y + m.mm_height for m in displays.values()])
-    display_width = max([m.width + m.x for m in displays.values()])
-    display_height = max([m.height + m.y for m in displays.values()])
+    # Use generator expressions instead of list comprehensions to avoid creating intermediate lists
+    mm_width = max(m.mm_x + m.mm_width for m in displays.values())
+    mm_height = max(m.mm_y + m.mm_height for m in displays.values())
+    display_width = max(m.width + m.x for m in displays.values())
+    display_height = max(m.height + m.y for m in displays.values())
     self.displays = displays
     self.__display_width = display_width
     self.__display_height = display_height
@@ -290,10 +377,16 @@ class Canvas:
       source_rect = Canvas.__compute_source_rect(ratio, self.__fit_rect, display)
       logging.debug('display: %s', str(display))
       logging.debug('source_rect: %s', str(source_rect))
+      # Create cropped image
       source_img = source_image.crop(source_rect.box())
       display_rect = display.rect()
-      source_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
-      target.paste(source_img, display_rect.position())
+      # Resize the cropped image
+      resized_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
+      # Paste into target
+      target.paste(resized_img, display_rect.position())
+      # Explicitly close intermediate images to free memory
+      source_img.close()
+      resized_img.close()
     return target
 
   def __prepare_image(self, image):
@@ -356,6 +449,8 @@ class Canvas:
       image_rect.height = int(round(adjusted_height))
     target = source.resize(image_rect.size(), Image.Resampling.BILINEAR, pad_rect.box())
     target.paste(image, (x, y))
+    # Close intermediate blurred image as it's no longer needed
+    source.close()
     return target
 
   def __crop_image(self, image: Image, image_ratio: float) -> Image:
@@ -376,6 +471,9 @@ class Canvas:
       edge = edge.crop(image_rect.shrink().box())
       box = Image.Image.getbbox(edge)
       box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
+      # Close intermediate images as they're no longer needed
+      img.close()
+      edge.close()
     else:
       box_rect = image_rect.copy()
     (cx, cy) = image_rect.center()
@@ -426,21 +524,27 @@ def normalize_displays(displays: {str: DisplayInfo}):
 
 def init_horizontal_references(displays: {str: DisplayInfo}, h_sorted_list):
   n = len(h_sorted_list)
+  # Cache references that might be accessed multiple times across different displays
+  ref_cache = {}
   i = 0
   while i < n:
     display = h_sorted_list[i]
     find_horz_relation(display, h_sorted_list, i)
     if display.x_reference_mode == ReferenceMode.Absolute:
       display.mm_x = display.x_reference_offset_mm
-    elif display.x_reference_mode == ReferenceMode.EndToEnd:
-      ref = displays[display.x_reference]
-      display.mm_x = ref.mm_x + ref.mm_width - display.mm_width + display.x_reference_offset_mm
-    elif display.x_reference_mode == ReferenceMode.StartToEnd:
-      ref = displays[display.x_reference]
-      display.mm_x = ref.mm_x + display.x_reference_offset_mm
-    elif display.x_reference_mode == ReferenceMode.EndToStart:
-      ref = displays[display.x_reference]
-      display.mm_x = ref.mm_x + ref.mm_width + display.x_reference_offset_mm
+    else:
+      # Use cached reference if available, otherwise lookup and cache
+      ref_name = display.x_reference
+      if ref_name not in ref_cache:
+        ref_cache[ref_name] = displays[ref_name]
+      ref = ref_cache[ref_name]
+      
+      if display.x_reference_mode == ReferenceMode.EndToEnd:
+        display.mm_x = ref.mm_x + ref.mm_width - display.mm_width + display.x_reference_offset_mm
+      elif display.x_reference_mode == ReferenceMode.StartToEnd:
+        display.mm_x = ref.mm_x + display.x_reference_offset_mm
+      elif display.x_reference_mode == ReferenceMode.EndToStart:
+        display.mm_x = ref.mm_x + ref.mm_width + display.x_reference_offset_mm
     i += 1
 
 
@@ -493,21 +597,27 @@ def find_horz_relation(display, h_sorted_list, i):
 
 def init_vertical_references(displays: {str: DisplayInfo}, v_sorted_list):
   n = len(v_sorted_list)
+  # Cache references that might be accessed multiple times across different displays
+  ref_cache = {}
   i = 0
   while i < n:
     display = v_sorted_list[i]
     find_vert_relation(display, v_sorted_list, i)
     if display.y_reference_mode == ReferenceMode.Absolute:
       display.mm_y = display.y_reference_offset_mm
-    elif display.y_reference_mode == ReferenceMode.EndToEnd:
-      ref = displays[display.y_reference]
-      display.mm_y = ref.mm_y + ref.mm_height - display.mm_height + display.y_reference_offset_mm
-    elif display.y_reference_mode == ReferenceMode.StartToEnd:
-      ref = displays[display.y_reference]
-      display.mm_y = ref.mm_y + display.y_reference_offset_mm
-    elif display.y_reference_mode == ReferenceMode.EndToStart:
-      ref = displays[display.y_reference]
-      display.mm_y = ref.mm_y + ref.mm_height + display.y_reference_offset_mm
+    else:
+      # Use cached reference if available, otherwise lookup and cache
+      ref_name = display.y_reference
+      if ref_name not in ref_cache:
+        ref_cache[ref_name] = displays[ref_name]
+      ref = ref_cache[ref_name]
+      
+      if display.y_reference_mode == ReferenceMode.EndToEnd:
+        display.mm_y = ref.mm_y + ref.mm_height - display.mm_height + display.y_reference_offset_mm
+      elif display.y_reference_mode == ReferenceMode.StartToEnd:
+        display.mm_y = ref.mm_y + display.y_reference_offset_mm
+      elif display.y_reference_mode == ReferenceMode.EndToStart:
+        display.mm_y = ref.mm_y + ref.mm_height + display.y_reference_offset_mm
     i += 1
 
 
@@ -579,8 +689,9 @@ def get_display_y(display: DisplayInfo):
 
 
 def normalize_positions(displays):
-  mm_origin_x = min([m.mm_x for m in displays.values()])
-  mm_origin_y = min([m.mm_y for m in displays.values()])
+  # Use generator expressions instead of list comprehensions to avoid creating intermediate lists
+  mm_origin_x = min(m.mm_x for m in displays.values())
+  mm_origin_y = min(m.mm_y for m in displays.values())
   if mm_origin_y != 0 or mm_origin_x != 0:
     for display in displays.values():
       display.mm_x -= mm_origin_x
@@ -651,24 +762,68 @@ def find_config_file():
 
 
 def read_image(input_file) -> Image:
-  _image = Image.open(input_file, mode='r')
+  """Read and fully load an image, closing the file handle."""
+  with Image.open(input_file, mode='r') as img:
+    # Convert to RGB to ensure consistent format and load into memory
+    if img.mode != 'RGB':
+      img = img.convert('RGB')
+    # Create a copy to ensure file handle is closed
+    _image = img.copy()
   return _image
+
+
+def determine_profile(config: Configuration):
+  """Determine the current profile based on monitor configuration.
+  
+  1. Get monitors as semicolon-separated string
+  2. Compute MD5 hash of monitors
+  3. Find profile section with matching hash_value
+  4. If found, set currentProfile to that profile
+  5. If not found, create new profile section and set currentProfile
+  """
+  # Step 1: Get monitors as semicolon-separated string
+  monitors_list = screeninfo.get_monitors()
+  monitor_data_str = ';'.join(str(m) for m in monitors_list)
+  monitor_names = [m.name for m in monitors_list if m.name is not None]
+  
+  # Step 2: Compute MD5 hash
+  hash_value = hashlib.md5(monitor_data_str.encode('utf-8')).hexdigest()
+  
+  # Step 3: Find profile section with matching hash_value
+  matched_profile = config.find_profile_by_hash(hash_value)
+  
+  # Step 4: If profile matched, set currentProfile
+  if matched_profile:
+    config.set_current_profile(matched_profile)
+  else:
+    # Step 5: Create new profile section
+    profile_name = 'profile_' + hash_value[-8:]
+    config.create_profile(profile_name, monitor_data_str, monitor_names, hash_value)
+    config.set_current_profile(profile_name)
 
 
 def spanned_image(config, input_file, output_file):
   displays = build_displays(config)
   canvas = Canvas(displays, config)
   image = read_image(input_file)
-  canvas.set_image(image)
-  result = canvas.paint()
-  logging.debug('saving image: %s', output_file)
   try:
-    result.save(output_file)
-    config = Configuration()
-    if config.debug:
-      result.save(os.path.join(TEMP_DIR, 'spanned-image.png'))
-  except Exception as e:
-    logging.error("saving writing %s with error %s", output_file, e)
+    canvas.set_image(image)
+    result = canvas.paint()
+    logging.debug('saving image: %s', output_file)
+    try:
+      result.save(output_file)
+      if config.debug:
+        result.save(os.path.join(TEMP_DIR, 'spanned-image.png'))
+    except Exception as e:
+      logging.error("saving writing %s with error %s", output_file, e)
+    finally:
+      # Clean up result image if it was created
+      if result is not None:
+        result.close()
+  finally:
+    # Clean up input image
+    if image is not None:
+      image.close()
 
 
 def print_monitors():
@@ -682,6 +837,7 @@ def print_usage():
 
 def main():
   config = Configuration()
+  determine_profile(config)
   if config.debug:
     logging.basicConfig(filename=os.path.join(TEMP_DIR, 'spanned_image.log'), level=logging.DEBUG, format='')
   else:
@@ -692,7 +848,10 @@ def main():
     print_monitors()
     if len(sys.argv) == 2:
       image = read_image(sys.argv[1])
-      print(image.size)
+      try:
+        print(image.size)
+      finally:
+        image.close()
 
   else:
     try:
