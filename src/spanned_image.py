@@ -5,13 +5,55 @@ from dataclasses import dataclass
 from PIL import Image, ImageFilter
 import sys
 import os
-import configparser
+import tomli
 import logging
+import tempfile
+from typing import Optional, Dict, Any
+from enum import Enum
 
 
 DEFAULT_DOT_PER_MM = 120 * 25.4
 MAX_CROP = 34
 ZERO = 'Zero'
+
+# Global temporary directory for logging and debug images
+TEMP_DIR = tempfile.gettempdir()
+
+
+class ReferenceMode(Enum):
+  Absolute = 'ABS'
+  EndToEnd = 'F2F'
+  StartToEnd = 'S2S'
+  EndToStart = 'F2S'
+
+
+@dataclass
+class DisplayConfig:
+  offsetX: float = 0.0
+  offsetY: float = 0.0
+  offsetXFrom: str = ZERO
+  offsetYFrom: str = ZERO
+  offsetXMode: ReferenceMode = ReferenceMode.StartToEnd
+  offsetYMode: ReferenceMode = ReferenceMode.StartToEnd
+
+  @classmethod
+  def from_dict(cls, data: Dict[str, Any]) -> 'DisplayConfig':
+    """Create DisplayConfig from a dictionary, using defaults for missing keys."""
+    # Helper to convert string to ReferenceMode
+    def to_mode(mode_str: str) -> ReferenceMode:
+      try:
+        return ReferenceMode(mode_str.upper())
+      except (ValueError, AttributeError, TypeError):
+        return ReferenceMode.StartToEnd
+    
+    return cls(
+      offsetX=float(data.get('offsetX', 0.0)),
+      offsetY=float(data.get('offsetY', 0.0)),
+      offsetXFrom=data.get('offsetXFrom', ZERO),
+      offsetYFrom=data.get('offsetYFrom', ZERO),
+      offsetXMode=to_mode(data.get('offsetXMode', 'S2S')),
+      offsetYMode=to_mode(data.get('offsetYMode', 'S2S'))
+    )
 
 
 @dataclass
@@ -22,29 +64,48 @@ class Configuration:
   debug: bool = False
   center: str = ''
 
-  __config = None
-
   def __init__(self):
+    self.__config: Optional[Dict[str, Any]] = None
+    self.__current_profile: str = 'profile1'
     _found_config = find_config_file()
     if _found_config is not None:
-      self.__config = configparser.RawConfigParser()
-      self.__config.read(_found_config)
-      _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
+      with open(_found_config, 'rb') as f:
+        self.__config = tomli.load(f)
+      
+      # Read Config section
+      config_section = self.__config.get('Config', {})
+      _crop = float(config_section.get('crop', 0.0))
       self.crop = _crop if 0.0 <= _crop <= MAX_CROP else 0.0
-      _padding = str(self.__config.get('Config', 'padding', fallback=self.padding))
+      _padding = str(config_section.get('padding', self.padding))
       self.padding = _padding.upper() in ['TRUE', 'ON']
-      _trim = str(self.__config.get('Config', 'padding', fallback=self.trim))
+      _trim = str(config_section.get('trim', self.trim))
       self.trim = _trim.upper() in ['TRUE', 'ON']
-      _debug = str(self.__config.get('Config', 'debug', fallback=self.debug))
+      _debug = str(config_section.get('debug', self.debug))
       self.debug = _debug.upper() in ['TRUE', 'ON']
+      self.center = str(config_section.get('center', self.center))
+      self.__current_profile = str(config_section.get('currentProfile', 'profile1'))
 
-  def config(self):
-    return self.__config
-
-  def get(self, section_name, key_name, fallback=None):
+  def currentProfile(self, display_name: str) -> DisplayConfig:
+    """Return DisplayConfig for the given display name based on the active profile.
+    
+    First checks for display config in the active profile (e.g., [profile2.DP-4]).
+    If not found, falls back to a top-level section (e.g., [DP-4]).
+    """
     if self.__config is None:
-      return fallback
-    return self.__config.get(section_name, key_name, fallback=fallback)
+      return DisplayConfig()
+    
+    profile_name = self.__current_profile
+    profile_section = self.__config.get(profile_name, {})
+    
+    # Look for display config under profile (e.g., profile1.DP-4 as nested table)
+    # TOML nested tables like [profile1.DP-4] are parsed as profile_section['DP-4']
+    display_data = profile_section.get(display_name, {})
+    
+    # Fallback to top-level section if profile-specific config doesn't exist
+    if not display_data:
+      display_data = self.__config.get(display_name, {})
+    
+    return DisplayConfig.from_dict(display_data)
 
 
 @dataclass
@@ -123,10 +184,10 @@ class DisplayInfo:
   mm_height: float = None
   is_primary: bool = None
   x_reference: str = None
-  x_reference_mode: str = None
+  x_reference_mode: Optional[ReferenceMode] = None
   x_reference_offset_mm: float = 0.0
   y_reference: str = None
-  y_reference_mode: str = None
+  y_reference_mode: Optional[ReferenceMode] = None
   y_reference_offset_mm: float = 0.0
   x_ref_count: int = 0
   y_ref_count: int = 0
@@ -369,34 +430,35 @@ def init_horizontal_references(displays: {str: DisplayInfo}, h_sorted_list):
   while i < n:
     display = h_sorted_list[i]
     find_horz_relation(display, h_sorted_list, i)
-    if display.x_reference_mode == 'ABS':
+    if display.x_reference_mode == ReferenceMode.Absolute:
       display.mm_x = display.x_reference_offset_mm
-    elif display.x_reference_mode == 'F2F':
+    elif display.x_reference_mode == ReferenceMode.EndToEnd:
       ref = displays[display.x_reference]
       display.mm_x = ref.mm_x + ref.mm_width - display.mm_width + display.x_reference_offset_mm
-    elif display.x_reference_mode == 'S2S':
+    elif display.x_reference_mode == ReferenceMode.StartToEnd:
       ref = displays[display.x_reference]
       display.mm_x = ref.mm_x + display.x_reference_offset_mm
-    elif display.x_reference_mode == 'F2S':
+    elif display.x_reference_mode == ReferenceMode.EndToStart:
       ref = displays[display.x_reference]
       display.mm_x = ref.mm_x + ref.mm_width + display.x_reference_offset_mm
     i += 1
 
 
 def read_horz_offset_from_config(config, display, displays):
-
-  if config and config.get(display.name, 'offsetXFrom', fallback=None):
-    ref_name: str = config.get(display.name, 'offsetXFrom', fallback=None)
-    if ref_name == ZERO:
-      display.x_reference_mode = 'ABS'
-      display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
-    elif ref_name in displays.keys():
-      ref: DisplayInfo = displays[ref_name]
-      if ref:
-        display.x_reference = ref_name
-        display.x_reference_mode = config.get(display.name, 'offsetXMode', fallback='S2S')
-        display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
-        ref.x_ref_count += 1
+  if config:
+    display_config = config.currentProfile(display.name)
+    if display_config.offsetXFrom:
+      ref_name: str = display_config.offsetXFrom
+      if ref_name == ZERO:
+        display.x_reference_mode = ReferenceMode.Absolute
+        display.x_reference_offset_mm = display_config.offsetX
+      elif ref_name in displays.keys():
+        ref: DisplayInfo = displays[ref_name]
+        if ref:
+          display.x_reference = ref_name
+          display.x_reference_mode = display_config.offsetXMode
+          display.x_reference_offset_mm = display_config.offsetX
+          ref.x_ref_count += 1
 
 
 def find_horz_relation(display, h_sorted_list, i):
@@ -407,17 +469,17 @@ def find_horz_relation(display, h_sorted_list, i):
     ref: DisplayInfo = h_sorted_list[j]
     if display.x == ref.x + ref.width:
       display.x_reference = ref.name
-      display.x_reference_mode = 'F2S'
+      display.x_reference_mode = ReferenceMode.EndToStart
       ref.x_ref_count += 1
       break
     elif display.x == ref.x:
       display.x_reference = ref.name
-      display.x_reference_mode = 'S2S'
+      display.x_reference_mode = ReferenceMode.StartToEnd
       ref.x_ref_count += 1
       break
     elif display.x + display.width == ref.x + ref.width:
       display.x_reference = ref.name
-      display.x_reference_mode = 'F2F'
+      display.x_reference_mode = ReferenceMode.EndToEnd
       ref.x_ref_count += 1
       break
     j += 1
@@ -425,7 +487,7 @@ def find_horz_relation(display, h_sorted_list, i):
     ref: DisplayInfo = find_display_left(display, h_sorted_list)
     if ref:
       display.x_reference = ref.name
-      display.x_reference_mode = 'F2S'
+      display.x_reference_mode = ReferenceMode.EndToStart
       ref.x_ref_count += 1
 
 
@@ -435,33 +497,35 @@ def init_vertical_references(displays: {str: DisplayInfo}, v_sorted_list):
   while i < n:
     display = v_sorted_list[i]
     find_vert_relation(display, v_sorted_list, i)
-    if display.y_reference_mode == 'ABS':
+    if display.y_reference_mode == ReferenceMode.Absolute:
       display.mm_y = display.y_reference_offset_mm
-    elif display.y_reference_mode == 'F2F':
+    elif display.y_reference_mode == ReferenceMode.EndToEnd:
       ref = displays[display.y_reference]
       display.mm_y = ref.mm_y + ref.mm_height - display.mm_height + display.y_reference_offset_mm
-    elif display.y_reference_mode == 'S2S':
+    elif display.y_reference_mode == ReferenceMode.StartToEnd:
       ref = displays[display.y_reference]
       display.mm_y = ref.mm_y + display.y_reference_offset_mm
-    elif display.y_reference_mode == 'F2S':
+    elif display.y_reference_mode == ReferenceMode.EndToStart:
       ref = displays[display.y_reference]
       display.mm_y = ref.mm_y + ref.mm_height + display.y_reference_offset_mm
     i += 1
 
 
 def read_vert_offset_from_config(config, display, displays):
-  if config and config.get(display.name, 'offsetYFrom', fallback=None):
-    ref_name: str = config.get(display.name, 'offsetYFrom', fallback=None)
-    if ref_name == ZERO:
-      display.y_reference_mode = 'ABS'
-      display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
-    elif ref_name in displays.keys():
-      ref: DisplayInfo = displays[ref_name]
-      if ref:
-        display.y_reference = ref_name
-        display.y_reference_mode = config.get(display.name, 'offsetYMode', fallback='S2S')
-        display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
-        ref.y_ref_count += 1
+  if config:
+    display_config = config.currentProfile(display.name)
+    if display_config.offsetYFrom:
+      ref_name: str = display_config.offsetYFrom
+      if ref_name == ZERO:
+        display.y_reference_mode = ReferenceMode.Absolute
+        display.y_reference_offset_mm = display_config.offsetY
+      elif ref_name in displays.keys():
+        ref: DisplayInfo = displays[ref_name]
+        if ref:
+          display.y_reference = ref_name
+          display.y_reference_mode = display_config.offsetYMode
+          display.y_reference_offset_mm = display_config.offsetY
+          ref.y_ref_count += 1
 
 
 def find_vert_relation(display, v_sorted_list, i):
@@ -472,17 +536,17 @@ def find_vert_relation(display, v_sorted_list, i):
     ref: DisplayInfo = v_sorted_list[j]
     if display.y == ref.y + ref.height:
       display.y_reference = ref.name
-      display.y_reference_mode = 'F2S'
+      display.y_reference_mode = ReferenceMode.EndToStart
       ref.y_ref_count += 1
       break
     elif display.y == ref.y:
       display.y_reference = ref.name
-      display.y_reference_mode = 'S2S'
+      display.y_reference_mode = ReferenceMode.StartToEnd
       ref.y_ref_count += 1
       break
     elif display.y + display.height == ref.y + ref.height:
       display.y_reference = ref.name
-      display.y_reference_mode = 'F2F'
+      display.y_reference_mode = ReferenceMode.EndToEnd
       ref.y_ref_count += 1
       break
     j += 1
@@ -490,7 +554,7 @@ def find_vert_relation(display, v_sorted_list, i):
     ref: DisplayInfo = find_display_above(display, v_sorted_list)
     if ref:
       display.y_reference = ref.name
-      display.y_reference_mode = 'F2S'
+      display.y_reference_mode = ReferenceMode.EndToStart
       ref.y_ref_count += 1
 
 
@@ -574,11 +638,11 @@ def get_user_config_directory():
 
 
 def find_config_file():
-  _local_config = os.path.join(os.path.dirname(__file__), 'spanned-image.ini')
+  _local_config = os.path.join(os.path.dirname(__file__), 'spanned-image.toml')
   _user_config_path = get_user_config_directory()
   _user_config = None
   if _user_config_path is not None:
-    _user_config = os.path.join(_user_config_path, 'spanned-image.ini')
+    _user_config = os.path.join(_user_config_path, 'spanned-image.toml')
   if _user_config is not None and os.path.exists(_user_config):
     return _user_config
   elif os.path.exists(_local_config):
@@ -602,7 +666,7 @@ def spanned_image(config, input_file, output_file):
     result.save(output_file)
     config = Configuration()
     if config.debug:
-      result.save('/tmp/spanned-image.png')
+      result.save(os.path.join(TEMP_DIR, 'spanned-image.png'))
   except Exception as e:
     logging.error("saving writing %s with error %s", output_file, e)
 
@@ -619,9 +683,9 @@ def print_usage():
 def main():
   config = Configuration()
   if config.debug:
-    logging.basicConfig(filename='/tmp/spanned_image.log', level=logging.DEBUG, format='')
+    logging.basicConfig(filename=os.path.join(TEMP_DIR, 'spanned_image.log'), level=logging.DEBUG, format='')
   else:
-    logging.basicConfig(filename='/tmp/spanned_image.log', level=logging.INFO, format='')
+    logging.basicConfig(filename=os.path.join(TEMP_DIR, 'spanned_image.log'), level=logging.INFO, format='')
   logging.info('parameters: %s', sys.argv)
   if len(sys.argv) != 3:
     print_usage()
