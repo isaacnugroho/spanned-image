@@ -23,17 +23,16 @@ TEMP_DIR = tempfile.gettempdir()
 
 
 class ReferenceMode(Enum):
-  Absolute = 'ABS' # absolute position
+  # absolute position
+  Absolute = 'ABS'
   # end to end, use referenced display's right/bottom edge
-  # to compute offset of current display's left/top edge
+  # to compute offset of current display's right/bottom edge
   EndToEnd = 'E2E'
   # start to end, use referenced display's left/top edge
-  # to compute offset of current display's left/top edge
-  # (e.g. DP-4's left edge is referenced to DP-3's left edge)
+  # to compute offset of current display's right/bottom edge
   StartToEnd = 'S2E' 
   # end to start, use referenced display's right/bottom edge
   # to compute offset of current display's left/top edge
-  # (e.g. DP-4's right edge is referenced to DP-3's right edge)  
   EndToStart = 'E2S'
 
 
@@ -43,8 +42,8 @@ class DisplayConfig:
   offsetY: float = 0.0
   offsetXFrom: str = ZERO
   offsetYFrom: str = ZERO
-  offsetXMode: ReferenceMode = ReferenceMode.StartToEnd
-  offsetYMode: ReferenceMode = ReferenceMode.StartToEnd
+  offsetXMode: ReferenceMode = ReferenceMode.EndToStart
+  offsetYMode: ReferenceMode = ReferenceMode.EndToStart
 
   @classmethod
   def from_dict(cls, data: Dict[str, Any]) -> 'DisplayConfig':
@@ -54,15 +53,15 @@ class DisplayConfig:
       try:
         return ReferenceMode(mode_str.upper())
       except (ValueError, AttributeError, TypeError):
-        return ReferenceMode.StartToEnd
+        return ReferenceMode.EndToStart
     
     return cls(
       offsetX=float(data.get('offsetX', 0.0)),
       offsetY=float(data.get('offsetY', 0.0)),
       offsetXFrom=data.get('offsetXFrom', ZERO),
       offsetYFrom=data.get('offsetYFrom', ZERO),
-      offsetXMode=to_mode(data.get('offsetXMode', 'S2S')),
-      offsetYMode=to_mode(data.get('offsetYMode', 'S2S'))
+      offsetXMode=to_mode(data.get('offsetXMode', 'E2S')),
+      offsetYMode=to_mode(data.get('offsetYMode', 'E2S'))
     )
 
 
@@ -74,9 +73,10 @@ class Configuration:
   debug: bool = False
   center: str = ''
 
-  def __init__(self):
+  def __init__(self, monitors):
+    self.monitors = monitors
     self.__config: Optional[Dict[str, Any]] = None
-    self.__current_profile: str = 'profile1'
+    self.__current_profile: str = 'profile_x'
     self.__config_file: Optional[str] = None
     _found_config = find_config_file()
     if _found_config is not None:
@@ -170,6 +170,46 @@ class Configuration:
       'monitors': monitor_names,
       'hashValue': hash_value
     }
+
+  def has_monitor_section(self, monitor_name: str) -> bool:
+    """Check if a monitor section exists in the current profile."""
+    if self.__config is None:
+      return False
+    profile_name = self.__current_profile
+    profile_section = self.__config.get(profile_name, {})
+    # TOML nested tables like [profile1.DP-4] are parsed as profile_section['DP-4']
+    return monitor_name in profile_section
+
+  def set_monitor_section(
+      self, 
+      monitor_name: str, 
+      offset_x_from: str, 
+      offset_x_mode: ReferenceMode,
+      offset_x: float, 
+      offset_y_from: str, 
+      offset_y_mode: ReferenceMode, 
+      offset_y: float
+  ):
+    """Add a monitor section to the current profile with default position."""
+    if self.__config is None:
+      self.__config = {}
+    
+    profile_name = self.__current_profile
+    if profile_name not in self.__config:
+      self.__config[profile_name] = {}
+    
+    profile_section = self.__config[profile_name]
+    # TOML nested tables like [profile1.DP-4] are stored as profile_section['DP-4']
+    profile_section[monitor_name] = {
+      'offsetXFrom': offset_x_from,
+      'offsetXMode': offset_x_mode.value,
+      'offsetX': offset_x,
+      'offsetYFrom': offset_y_from,
+      'offsetYMode': offset_y_mode.value,
+      'offsetY': offset_y
+    }
+    logging.info('added monitor section: %s', str(profile_section[monitor_name]))
+    self._write_config()
 
   def currentProfile(self, display_name: str) -> DisplayConfig:
     """Return DisplayConfig for the given display name based on the active profile.
@@ -499,7 +539,7 @@ class Canvas:
 
 def build_displays(config: Configuration):
   displays = {}
-  for m in screeninfo.get_monitors():
+  for m in config.monitors:
     display = DisplayInfo(m)
     displays[m.name] = display
 
@@ -532,7 +572,7 @@ def init_horizontal_references(displays: {str: DisplayInfo}, h_sorted_list):
     find_horz_relation(display, h_sorted_list, i)
     if display.x_reference_mode == ReferenceMode.Absolute:
       display.mm_x = display.x_reference_offset_mm
-    else:
+    elif display.x_reference_mode is not None and display.x_reference is not None:
       # Use cached reference if available, otherwise lookup and cache
       ref_name = display.x_reference
       if ref_name not in ref_cache:
@@ -605,7 +645,7 @@ def init_vertical_references(displays: {str: DisplayInfo}, v_sorted_list):
     find_vert_relation(display, v_sorted_list, i)
     if display.y_reference_mode == ReferenceMode.Absolute:
       display.mm_y = display.y_reference_offset_mm
-    else:
+    elif display.y_reference_mode is not None and display.y_reference is not None:
       # Use cached reference if available, otherwise lookup and cache
       ref_name = display.y_reference
       if ref_name not in ref_cache:
@@ -732,6 +772,39 @@ def find_display_above(display: DisplayInfo, display_list: [DisplayInfo]):
   return None
 
 
+def construct_displays(config: Configuration):
+  displays = {}
+  display_list = []
+  for m in config.monitors:
+    display = DisplayInfo(m)
+    displays[m.name] = display
+    display_list.append(display)
+
+  i = 0
+  while i < len(display_list):
+    ref = display_list[i]
+    ref.x_reference_offset_mm = 0.0
+    ref.y_reference_offset_mm = 0.0
+    if ref.x == 0:
+      ref.x_reference = ZERO
+      ref.x_reference_mode = ReferenceMode.Absolute
+    else:
+      left_of_ref = find_display_left(ref, display_list)
+      if left_of_ref:
+        ref.x_reference = left_of_ref.name
+        ref.x_reference_mode = ReferenceMode.EndToStart
+    if ref.y == 0:
+      ref.y_reference = ZERO
+      ref.y_reference_mode = ReferenceMode.Absolute
+    else:
+      above_of_ref = find_display_above(ref, display_list)
+      if above_of_ref:
+        ref.y_reference = above_of_ref.name
+        ref.y_reference_mode = ReferenceMode.EndToStart
+    i += 1
+  return displays
+
+
 # from tensorboard's util.py
 def get_user_config_directory():
   if os.name == 'nt':
@@ -782,7 +855,7 @@ def determine_profile(config: Configuration):
   5. If not found, create new profile section and set currentProfile
   """
   # Step 1: Get monitors as semicolon-separated string
-  monitors_list = screeninfo.get_monitors()
+  monitors_list = config.monitors
   monitor_data_str = ';'.join(str(m) for m in monitors_list)
   monitor_names = [m.name for m in monitors_list if m.name is not None]
   
@@ -800,6 +873,52 @@ def determine_profile(config: Configuration):
     profile_name = 'profile_' + hash_value[-8:]
     config.create_profile(profile_name, monitor_data_str, monitor_names, hash_value)
     config.set_current_profile(profile_name)
+
+
+def populate_profile(config: Configuration):
+  """Populate missing monitor sections in the current profile with default positions.
+  
+  1. Checks whether the monitor sections are complete for the current profile
+  2. If not, creates monitor section(s) for the profile with default position,
+     according to the monitor's (x, y) coordinates converted to mm.
+  """
+  # Get current monitors
+  monitors_list = config.monitors
+  
+  # Check which monitors are missing sections
+  any_missing = False
+  for monitor in monitors_list:
+    if monitor.name is None:
+      continue
+    
+    # Check if monitor section exists (nested table like [profile_1.DP-4])
+    if not config.has_monitor_section(monitor.name):
+      any_missing = True
+      break;
+
+  if any_missing:
+    normalized_displays = construct_displays(config)
+    for display in normalized_displays.values():
+      # Convert None values to defaults for TOML serialization
+      # If reference is None, use ZERO (absolute positioning)
+      # If reference_mode is None, use Absolute mode
+      offset_x_from = display.x_reference
+      offset_x_mode = display.x_reference_mode
+      offset_y_from = display.y_reference
+      offset_y_mode = display.y_reference_mode
+      
+      print('adding monitor section: name=%s x_reference=%s x_reference_mode=%s x_reference_offset_mm=%s y_reference=%s y_reference_mode=%s y_reference_offset_mm=%s' % (
+        display.name, offset_x_from, offset_x_mode, 
+        display.x_reference_offset_mm, offset_y_from, offset_y_mode, display.y_reference_offset_mm))
+      config.set_monitor_section(
+        display.name, 
+        offset_x_from, 
+        offset_x_mode, 
+        display.x_reference_offset_mm, 
+        offset_y_from, 
+        offset_y_mode, 
+        display.y_reference_offset_mm
+      )
 
 
 def spanned_image(config, input_file, output_file):
@@ -826,8 +945,8 @@ def spanned_image(config, input_file, output_file):
       image.close()
 
 
-def print_monitors():
-  for m in screeninfo.get_monitors():
+def print_monitors(config: Configuration):
+  for m in config.monitors:
     print(str(m))
 
 
@@ -836,8 +955,9 @@ def print_usage():
 
 
 def main():
-  config = Configuration()
+  config = Configuration(screeninfo.get_monitors())
   determine_profile(config)
+  populate_profile(config)
   if config.debug:
     logging.basicConfig(filename=os.path.join(TEMP_DIR, 'spanned_image.log'), level=logging.DEBUG, format='')
   else:
@@ -845,7 +965,7 @@ def main():
   logging.info('parameters: %s', sys.argv)
   if len(sys.argv) != 3:
     print_usage()
-    print_monitors()
+    print_monitors(config)
     if len(sys.argv) == 2:
       image = read_image(sys.argv[1])
       try:

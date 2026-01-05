@@ -8,3 +8,4 @@ env/
 .vscode/
 venv/
 *.iml
+.pytest_cache/
