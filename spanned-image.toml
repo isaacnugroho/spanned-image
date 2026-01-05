@@ -1,0 +1,15 @@
+[Config]
+# existing config.*
+currentProfile = "profile_1"
+padding = false
+trim = false
+crop = 0.0
+debug = false
+center = ""
+
+[profile_1]
+
+[profile_1.DP-4]
+offsetX = 100
+offsetY = 33
+

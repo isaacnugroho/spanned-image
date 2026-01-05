@@ -1,642 +1,970 @@
 #!/usr/bin/python
-import screeninfo
-from screeninfo import Monitor
-from dataclasses import dataclass
-from PIL import Image, ImageFilter
 import sys
 import os
-import configparser
+from dataclasses import dataclass
 import logging
+import tempfile
+import hashlib
+from typing import Optional, Dict, Any
+from enum import Enum
+import tomli
+import tomli_w
+import screeninfo
+from screeninfo import Monitor
+from PIL import Image, ImageFilter
 
 
 DEFAULT_DOT_PER_MM = 120 * 25.4
 MAX_CROP = 34
 ZERO = 'Zero'
 
+# Global temporary directory for logging and debug images
+TEMP_DIR = tempfile.gettempdir()
+
+
+class ReferenceMode(Enum):
+    # absolute position
+    Absolute = 'ABS'
+    # end to end, use referenced display's right/bottom edge
+    # to compute offset of current display's right/bottom edge
+    EndToEnd = 'E2E'
+    # start to end, use referenced display's left/top edge
+    # to compute offset of current display's right/bottom edge
+    StartToEnd = 'S2E'
+    # end to start, use referenced display's right/bottom edge
+    # to compute offset of current display's left/top edge
+    EndToStart = 'E2S'
+
+
+@dataclass
+class DisplayConfig:
+    offsetX: float = 0.0
+    offsetY: float = 0.0
+    offsetXFrom: str = ZERO
+    offsetYFrom: str = ZERO
+    offsetXMode: ReferenceMode = ReferenceMode.EndToStart
+    offsetYMode: ReferenceMode = ReferenceMode.EndToStart
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'DisplayConfig':
+        """Create DisplayConfig from a dictionary, using defaults for missing keys."""
+        # Helper to convert string to ReferenceMode
+        def to_mode(mode_str: str) -> ReferenceMode:
+            try:
+                return ReferenceMode(mode_str.upper())
+            except (ValueError, AttributeError, TypeError):
+                return ReferenceMode.EndToStart
+
+        return cls(
+            offsetX=float(data.get('offsetX', 0.0)),
+            offsetY=float(data.get('offsetY', 0.0)),
+            offsetXFrom=data.get('offsetXFrom', ZERO),
+            offsetYFrom=data.get('offsetYFrom', ZERO),
+            offsetXMode=to_mode(data.get('offsetXMode', 'E2S')),
+            offsetYMode=to_mode(data.get('offsetYMode', 'E2S'))
+        )
+
 
 @dataclass
 class Configuration:
-  padding: bool = False
-  trim: bool = False
-  crop: float = 0.0
-  debug: bool = False
-  center: str = ''
+    padding: bool = False
+    trim: bool = False
+    crop: float = 0.0
+    debug: bool = False
+    center: str = ''
 
-  __config = None
+    def __init__(self, monitors):
+        self.monitors = monitors
+        self.__config: Optional[Dict[str, Any]] = None
+        self.__current_profile: str = 'profile_x'
+        self.__config_file: Optional[str] = None
+        _found_config = find_config_file()
+        if _found_config is not None:
+            self.__config_file = _found_config
+            with open(_found_config, 'rb') as f:
+                self.__config = tomli.load(f)
 
-  def __init__(self):
-    _found_config = find_config_file()
-    if _found_config is not None:
-      self.__config = configparser.RawConfigParser()
-      self.__config.read(_found_config)
-      _crop = float(self.__config.get('Config', 'crop', fallback=0.0))
-      self.crop = _crop if 0.0 <= _crop <= MAX_CROP else 0.0
-      _padding = str(self.__config.get('Config', 'padding', fallback=self.padding))
-      self.padding = _padding.upper() in ['TRUE', 'ON']
-      _trim = str(self.__config.get('Config', 'padding', fallback=self.trim))
-      self.trim = _trim.upper() in ['TRUE', 'ON']
-      _debug = str(self.__config.get('Config', 'debug', fallback=self.debug))
-      self.debug = _debug.upper() in ['TRUE', 'ON']
+            # Read Config section
+            config_section = self.__config.get('Config', {})
+            _crop = float(config_section.get('crop', 0.0))
+            self.crop = _crop if 0.0 <= _crop <= MAX_CROP else 0.0
+            _padding = str(config_section.get('padding', self.padding))
+            self.padding = _padding.upper() in ['TRUE', 'ON']
+            _trim = str(config_section.get('trim', self.trim))
+            self.trim = _trim.upper() in ['TRUE', 'ON']
+            _debug = str(config_section.get('debug', self.debug))
+            self.debug = _debug.upper() in ['TRUE', 'ON']
+            self.center = str(config_section.get('center', self.center))
+            self.__current_profile = str(config_section.get('currentProfile', 'profile1'))
+        else:
+            # No config file found, create one with default values
+            self._create_default_config()
 
-  def config(self):
-    return self.__config
+    def _create_default_config(self):
+        """Create a config file with default values when no config file exists."""
+        # Determine where to create the config file (prefer user config directory)
+        _user_config_path = get_user_config_directory()
+        if _user_config_path is not None:
+            _user_config = os.path.join(_user_config_path, 'spanned-image.toml')
+            self.__config_file = _user_config
+        else:
+            _local_config = os.path.join(os.path.dirname(__file__), 'spanned-image.toml')
+            self.__config_file = _local_config
 
-  def get(self, section_name, key_name, fallback=None):
-    if self.__config is None:
-      return fallback
-    return self.__config.get(section_name, key_name, fallback=fallback)
+        # Initialize config with default values
+        self.__config = {
+          'Config': {
+            'currentProfile': self.__current_profile,
+            'padding': self.padding,
+            'trim': self.trim,
+            'crop': self.crop,
+            'debug': self.debug,
+            'center': self.center
+          }
+        }
+        # Write the default config file
+        self._write_config()
+
+    def set_current_profile(self, profile_name: str):
+        """Set the current profile and update the config file."""
+        self.__current_profile = profile_name
+        if self.__config is not None:
+            if 'Config' not in self.__config:
+                self.__config['Config'] = {}
+            self.__config['Config']['currentProfile'] = profile_name
+            self._write_config()
+
+    def _write_config(self):
+        """Write the config back to the file."""
+        if self.__config_file is not None and self.__config is not None:
+            try:
+                # Ensure Config section exists with currentProfile
+                if 'Config' not in self.__config:
+                    self.__config['Config'] = {}
+                self.__config['Config']['currentProfile'] = self.__current_profile
+                # Ensure directory exists
+                config_dir = os.path.dirname(self.__config_file)
+                if config_dir and not os.path.exists(config_dir):
+                    os.makedirs(config_dir, exist_ok=True)
+                with open(self.__config_file, 'wb') as f:
+                    tomli_w.dump(self.__config, f)
+            except Exception as e:
+                logging.warning("Failed to write config file: %s", e)
+
+    def find_profile_by_hash(self, hash_value: str) -> Optional[str]:
+        """Find a profile section with matching hash_value. Returns profile name or None."""
+        if self.__config is None:
+            return None
+        for key, value in self.__config.items():
+            if key.startswith('profile_') and isinstance(value, dict) and value.get('hashValue') == hash_value:
+                return key
+        return None
+
+    def create_profile(self, profile_name: str, monitor_data_str: str, monitor_names: list, hash_value: str):
+        """Create a new profile section with monitorData, monitors array, and hash_value."""
+        if self.__config is None:
+            self.__config = {}
+        self.__config[profile_name] = {
+            'monitorData': monitor_data_str,
+            'monitors': monitor_names,
+            'hashValue': hash_value
+        }
+
+    def has_monitor_section(self, monitor_name: str) -> bool:
+        """Check if a monitor section exists in the current profile."""
+        if self.__config is None:
+            return False
+        profile_name = self.__current_profile
+        profile_section = self.__config.get(profile_name, {})
+        # TOML nested tables like [profile1.DP-4] are parsed as profile_section['DP-4']
+        return monitor_name in profile_section
+
+    def set_monitor_section(
+        self,
+        monitor_name: str,
+        offset_x_from: str,
+        offset_x_mode: ReferenceMode,
+        offset_x: float,
+        offset_y_from: str,
+        offset_y_mode: ReferenceMode,
+        offset_y: float
+    ):
+        """Add a monitor section to the current profile with default position."""
+        if self.__config is None:
+            self.__config = {}
+
+        profile_name = self.__current_profile
+        if profile_name not in self.__config:
+            self.__config[profile_name] = {}
+
+        profile_section = self.__config[profile_name]
+        # TOML nested tables like [profile1.DP-4] are stored as profile_section['DP-4']
+        profile_section[monitor_name] = {
+            'offsetXFrom': offset_x_from,
+            'offsetXMode': offset_x_mode.value,
+            'offsetX': offset_x,
+            'offsetYFrom': offset_y_from,
+            'offsetYMode': offset_y_mode.value,
+            'offsetY': offset_y
+        }
+        logging.info('added monitor section: %s', str(profile_section[monitor_name]))
+        self._write_config()
+
+    def currentProfile(self, display_name: str) -> DisplayConfig:
+        """Return DisplayConfig for the given display name based on the active profile.
+
+        First checks for display config in the active profile (e.g., [profile2.DP-4]).
+        If not found, falls back to a top-level section (e.g., [DP-4]).
+        """
+        if self.__config is None:
+            return DisplayConfig()
+
+        profile_name = self.__current_profile
+        profile_section = self.__config.get(profile_name, {})
+
+        # Look for display config under profile (e.g., profile1.DP-4 as nested table)
+        # TOML nested tables like [profile1.DP-4] are parsed as profile_section['DP-4']
+        display_data = profile_section.get(display_name, {})
+
+        # Fallback to top-level section if profile-specific config doesn't exist
+        if not display_data:
+            display_data = self.__config.get(display_name, {})
+
+        return DisplayConfig.from_dict(display_data)
 
 
 @dataclass
 class Position:
-  x: int | float
-  y: int | float
+    x: int | float
+    y: int | float
 
 
 @dataclass
 class Rect:
-  x: int | float
-  y: int | float
-  width: int | float
-  height: int | float
+    x: int | float
+    y: int | float
+    width: int | float
+    height: int | float
 
-  def size(self):
-    return int(round(self.width)), int(round(self.height))
+    def size(self):
+        return int(round(self.width)), int(round(self.height))
 
-  def position(self):
-    return self.x, self.y
+    def position(self):
+        return self.x, self.y
 
-  def box(self):
-    return int(round(self.x)), int(round(self.y)), \
-           int(round(self.x + self.width)), int(round(self.y + self.height))
+    def box(self):
+        return int(round(self.x)), int(round(self.y)), int(round(self.x + self.width)), int(round(self.y + self.height))
 
-  def copy(self):
-    return Rect(self.x, self.y, self.width, self.height)
+    def copy(self):
+        return Rect(self.x, self.y, self.width, self.height)
 
-  def __init__(self, x: int | float, y: int | float, width: int | float, height: int | float):
-    self.x = x
-    self.y = y
-    self.width = width
-    self.height = height
+    def __init__(self, x: int | float, y: int | float, width: int | float, height: int | float):
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
 
-  def vh_ratio(self):
-    return float(self.height) / self.width
+    def vh_ratio(self):
+        return float(self.height) / self.width
 
-  def center(self):
-    return Position(self.x + self.width / 2, self.y + self.height / 2)
+    def center(self):
+        return Position(self.x + self.width / 2, self.y + self.height / 2)
 
-  def shrink(self, n=1):
-    return Rect(self.x + n, self.y + n, self.width - n * 2, self.height - n * 2)
+    def shrink(self, n=1):
+        return Rect(self.x + n, self.y + n, self.width - n * 2, self.height - n * 2)
 
-  def grow(self, n=1):
-    return Rect(self.x - n, self.y - n, self.width + n * 2, self.height + n * 2)
+    def grow(self, n=1):
+        return Rect(self.x - n, self.y - n, self.width + n * 2, self.height + n * 2)
 
-  @staticmethod
-  def of(image: Image):
-    return Rect(0, 0, image.width, image.height)
+    @staticmethod
+    def of(image: Image):
+        return Rect(0, 0, image.width, image.height)
 
-  @staticmethod
-  def of_tuple(values: ()):
-    if values is None:
-      return Rect(0, 0, 0, 0)
-    if len(values) == 2:
-      return Rect(0, 0, float(values[0]), float(values[1]))
-    elif len(values) >= 4:
-      x0 = float(values[0])
-      y0 = float(values[1])
-      x1 = float(values[2])
-      y1 = float(values[3])
-      return Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
-    return Rect(0, 0, 0, 0)
+    @staticmethod
+    def of_tuple(values: ()):
+        if values is None:
+            return Rect(0, 0, 0, 0)
+        if len(values) == 2:
+            return Rect(0, 0, float(values[0]), float(values[1]))
+        if len(values) >= 4:
+            x0 = float(values[0])
+            y0 = float(values[1])
+            x1 = float(values[2])
+            y1 = float(values[3])
+            return Rect(x0, y0, x1 - x0 + 1, y1 - y0 + 1)
+        return Rect(0, 0, 0, 0)
 
 
 @dataclass
 class DisplayInfo:
-  x: int
-  y: int
-  width: int
-  height: int
-  name: str = None
-  mm_x: float = 0.0
-  mm_y: float = 0.0
-  mm_width: float = None
-  mm_height: float = None
-  is_primary: bool = None
-  x_reference: str = None
-  x_reference_mode: str = None
-  x_reference_offset_mm: float = 0.0
-  y_reference: str = None
-  y_reference_mode: str = None
-  y_reference_offset_mm: float = 0.0
-  x_ref_count: int = 0
-  y_ref_count: int = 0
+    x: int
+    y: int
+    width: int
+    height: int
+    name: str = None
+    mm_x: float = 0.0
+    mm_y: float = 0.0
+    mm_width: float = None
+    mm_height: float = None
+    is_primary: bool = None
+    x_reference: str = None
+    x_reference_mode: Optional[ReferenceMode] = None
+    x_reference_offset_mm: float = 0.0
+    y_reference: str = None
+    y_reference_mode: Optional[ReferenceMode] = None
+    y_reference_offset_mm: float = 0.0
+    x_ref_count: int = 0
+    y_ref_count: int = 0
 
-  def __init__(self, monitor: Monitor):
-    assert monitor is not None
-    assert monitor.name is not None
-    self.x = monitor.x
-    self.y = monitor.y
-    self.width = monitor.width
-    self.height = monitor.height
-    self.is_primary = (monitor.is_primary == True)
-    self.name = monitor.name
-    if monitor.width_mm:
-      mm_width = monitor.width_mm
-    else:
-      mm_width = monitor.width / DEFAULT_DOT_PER_MM
-    if monitor.height_mm:
-      mm_height = monitor.height_mm
-    else:
-      mm_height = monitor.height / DEFAULT_DOT_PER_MM
+    def __init__(self, monitor: Monitor):
+        assert monitor is not None
+        assert monitor.name is not None
+        self.x = monitor.x
+        self.y = monitor.y
+        self.width = monitor.width
+        self.height = monitor.height
+        self.is_primary = monitor.is_primary
+        self.name = monitor.name
+        if monitor.width_mm:
+            mm_width = monitor.width_mm
+        else:
+            mm_width = monitor.width / DEFAULT_DOT_PER_MM
+        if monitor.height_mm:
+            mm_height = monitor.height_mm
+        else:
+            mm_height = monitor.height / DEFAULT_DOT_PER_MM
 
-    # swap if rotated
-    if (monitor.width < monitor.height) == (mm_width < mm_height):
-      self.mm_width = float(mm_width)
-      self.mm_height = float(mm_height)
-    else:
-      self.mm_width = float(mm_height)
-      self.mm_height = float(mm_width)
+        # swap if rotated
+        if (monitor.width < monitor.height) == (mm_width < mm_height):
+            self.mm_width = float(mm_width)
+            self.mm_height = float(mm_height)
+        else:
+            self.mm_width = float(mm_height)
+            self.mm_height = float(mm_width)
 
-  def rect(self):
-    return Rect(self.x, self.y, self.width, self.height)
+    def rect(self):
+        return Rect(self.x, self.y, self.width, self.height)
 
-  def mm_rect(self):
-    return Rect(self.mm_x, self.mm_y, self.mm_width, self.mm_height)
+    def mm_rect(self):
+        return Rect(self.mm_x, self.mm_y, self.mm_width, self.mm_height)
 
-  def mm_right(self):
-    return self.mm_x + self.mm_width
+    def mm_right(self):
+        return self.mm_x + self.mm_width
 
-  def mm_bottom(self):
-    return self.mm_y + self.mm_height
+    def mm_bottom(self):
+        return self.mm_y + self.mm_height
 
 
 @dataclass
 class Canvas:
-  displays: {str: DisplayInfo}
-  __display_width: int
-  __display_height: int
-  __canvas_rect: Rect = None
-  __canvas_ratio: float = 1.0
-  __image_size: Rect = None
-  __fit_rect: Rect = None
-  __image: Image = None
-  __padding: bool = False
-  __crop: float = 0.0
-  __trim: bool = False
-  __canvas_center: Position = None
-  __offset: Position = None
+    displays: {str: DisplayInfo}
+    __display_width: int
+    __display_height: int
+    __canvas_rect: Rect = None
+    __canvas_ratio: float = 1.0
+    __image_size: Rect = None
+    __fit_rect: Rect = None
+    __image: Image = None
+    __padding: bool = False
+    __crop: float = 0.0
+    __trim: bool = False
 
-  def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
-    assert displays is not None
-    mm_width = max([m.mm_x + m.mm_width for m in displays.values()])
-    mm_height = max([m.mm_y + m.mm_height for m in displays.values()])
-    display_width = max([m.width + m.x for m in displays.values()])
-    display_height = max([m.height + m.y for m in displays.values()])
-    self.displays = displays
-    self.__display_width = display_width
-    self.__display_height = display_height
-    self.__canvas_rect = Rect(0, 0, mm_width, mm_height)
-    self.__canvas_ratio = self.__canvas_rect.vh_ratio()
-    self.__canvas_center = self.__canvas_rect.center()
-    if config is not None:
-      self.__padding = config.padding
-      self.__crop = config.crop
-      self.__trim = config.trim
-      self.__offset = self.__set_offset(config)
+    def __init__(self, displays: {str: DisplayInfo}, config: Configuration = None):
+        assert displays is not None
+        # Use generator expressions instead of list comprehensions to avoid creating intermediate lists
+        mm_width = max(m.mm_x + m.mm_width for m in displays.values())
+        mm_height = max(m.mm_y + m.mm_height for m in displays.values())
+        display_width = max(m.width + m.x for m in displays.values())
+        display_height = max(m.height + m.y for m in displays.values())
+        self.displays = displays
+        self.__display_width = display_width
+        self.__display_height = display_height
+        self.__canvas_rect = Rect(0, 0, mm_width, mm_height)
+        self.__canvas_ratio = self.__canvas_rect.vh_ratio()
+        if config is not None:
+            self.__padding = config.padding
+            self.__crop = config.crop
+            self.__trim = config.trim
 
-  def display_size(self):
-    return self.__display_width, self.__display_height
+    def display_size(self):
+        return self.__display_width, self.__display_height
 
-  def set_image(self, image: Image):
-    self.__prepare_image(image)
+    def set_image(self, image: Image):
+        self.__prepare_image(image)
 
-  def get_image(self):
-    return self.__image
+    def get_image(self):
+        return self.__image
 
-  def paint(self) -> Image:
-    target = Image.new('RGB', self.display_size(), 'black')
-    if self.__image is None:
-      return target
+    def paint(self) -> Image:
+        target = Image.new('RGB', self.display_size(), 'black')
+        if self.__image is None:
+            return target
 
-    assert self.__fit_rect is not None
-    source_image = self.__image
+        assert self.__fit_rect is not None
+        source_image = self.__image
 
-    ratio = self.__fit_rect.width / self.__canvas_rect.width
-    logging.debug('image_rect: %s', str(self.__image_size))
-    logging.debug('fit_rect: %s', str(self.__fit_rect))
-    logging.debug('canvas_rect: %s', str(self.__canvas_rect))
-    for display in self.displays.values():
-      source_rect = Canvas.__compute_source_rect(ratio, self.__fit_rect, display)
-      logging.debug('display: %s', str(display))
-      logging.debug('source_rect: %s', str(source_rect))
-      source_img = source_image.crop(source_rect.box())
-      display_rect = display.rect()
-      source_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
-      target.paste(source_img, display_rect.position())
-    return target
+        ratio = self.__fit_rect.width / self.__canvas_rect.width
+        logging.debug('image_rect: %s', str(self.__image_size))
+        logging.debug('fit_rect: %s', str(self.__fit_rect))
+        logging.debug('canvas_rect: %s', str(self.__canvas_rect))
+        for display in self.displays.values():
+            source_rect = Canvas.__compute_source_rect(ratio, self.__fit_rect, display)
+            logging.debug('display: %s', str(display))
+            logging.debug('source_rect: %s', str(source_rect))
+            # Create cropped image
+            source_img = source_image.crop(source_rect.box())
+            display_rect = display.rect()
+            # Resize the cropped image
+            resized_img = source_img.resize(display_rect.size(), Image.Resampling.BICUBIC)
+            # Paste into target
+            target.paste(resized_img, display_rect.position())
+            # Explicitly close intermediate images to free memory
+            source_img.close()
+            resized_img.close()
+        return target
 
-  def __prepare_image(self, image):
-    image_rect = Rect.of(image)
-    image_ratio = image_rect.vh_ratio()
-    if self.__canvas_ratio == image_ratio:
-      self.__image = image
-      self.__image_size = image_rect
-      self.__fit_rect = image_rect
-      return
-    (adjusted_image, fit_rect) = self.__adjust_image(image, image_ratio)
-    self.__image = adjusted_image
-    self.__image_size = Rect.of(adjusted_image)
-    self.__fit_rect = fit_rect
+    def __prepare_image(self, image):
+        image_rect = Rect.of(image)
+        image_ratio = image_rect.vh_ratio()
+        if self.__canvas_ratio == image_ratio:
+            self.__image = image
+            self.__image_size = image_rect
+            self.__fit_rect = image_rect
+            return
+        (adjusted_image, fit_rect) = self.__adjust_image(image, image_ratio)
+        self.__image = adjusted_image
+        self.__image_size = Rect.of(adjusted_image)
+        self.__fit_rect = fit_rect
 
-  def __set_offset(self, config: Configuration):
-    if config.center in self.displays.keys():
-      display = self.displays[config.center]
-      display_center: Position = display.mm_rect().center()
-      return Position(display_center.x, display_center.y)
-    return None
+    def __adjust_image(self, image: Image, image_ratio: float) -> (Image, Rect):
+        cropped = self.__crop_image(image, image_ratio)
+        image_rect = Rect.of(cropped)
+        _image_ratio = image_rect.vh_ratio()
+        if self.__canvas_ratio < _image_ratio:
+            image_rect.height = cropped.width * self.__canvas_ratio
+            image_rect.y = (cropped.height - image_rect.height) * 0.5
+        else:
+            image_rect.width = cropped.height / self.__canvas_ratio
+            image_rect.x = (cropped.width - image_rect.width) * 0.5
 
-  def __adjust_image(self, image: Image, image_ratio: float) -> (Image, Rect):
-    cropped = self.__crop_image(image, image_ratio)
-    image_rect = Rect.of(cropped)
-    _image_ratio = image_rect.vh_ratio()
-    if self.__canvas_ratio < _image_ratio:
-      image_rect.height = cropped.width * self.__canvas_ratio
-      image_rect.y = (cropped.height - image_rect.height) * 0.5
-    else:
-      image_rect.width = cropped.height / self.__canvas_ratio
-      image_rect.x = (cropped.width - image_rect.width) * 0.5
+        if self.__padding:
+            padded = self.__pad_image(cropped, image_rect, _image_ratio)
+            return padded, Rect.of(padded)
+        return cropped, image_rect
 
-    if self.__padding:
-      padded = self.__pad_image(cropped, image_rect, _image_ratio)
-      return padded, Rect.of(padded)
-    return cropped, image_rect
+    @staticmethod
+    def __compute_source_rect(ratio: float, fit_rect: Rect, display: DisplayInfo) -> Rect:
+        x = ratio * display.mm_x + fit_rect.x
+        y = ratio * display.mm_y + fit_rect.y
+        width = ratio * display.mm_width
+        height = ratio * display.mm_height
+        return Rect(x, y, width, height)
 
-  @staticmethod
-  def __compute_source_rect(ratio: float, fit_rect: Rect, display: DisplayInfo) -> Rect:
-    x = ratio * display.mm_x + fit_rect.x
-    y = ratio * display.mm_y + fit_rect.y
-    width = ratio * display.mm_width
-    height = ratio * display.mm_height
-    return Rect(x, y, width, height)
+    def __pad_image(self, image: Image, pad_rect: Rect, image_ratio: float) -> Image:
+        image_rect = Rect.of(image)
+        source = image.filter(ImageFilter.BoxBlur(radius=16))
+        x = 0
+        y = 0
+        if image_ratio > self.__canvas_ratio:
+            adjusted_width = image_rect.height / self.__canvas_ratio
+            x = round((adjusted_width - image_rect.width) * 0.5)
+            image_rect.width = int(round(adjusted_width))
+        else:
+            adjusted_height = image_rect.width * self.__canvas_ratio
+            y = round((adjusted_height - image_rect.height) * 0.5)
+            image_rect.height = int(round(adjusted_height))
+        target = source.resize(image_rect.size(), Image.Resampling.BILINEAR, pad_rect.box())
+        target.paste(image, (x, y))
+        # Close intermediate blurred image as it's no longer needed
+        source.close()
+        return target
 
-  def __pad_image(self, image: Image, pad_rect: Rect, image_ratio: float) -> Image:
-    image_rect = Rect.of(image)
-    from PIL import ImageFilter
-    source = image.filter(ImageFilter.BoxBlur(radius=16))
-    x = 0
-    y = 0
-    if image_ratio > self.__canvas_ratio:
-      adjusted_width = image_rect.height / self.__canvas_ratio
-      x = round((adjusted_width - image_rect.width) * 0.5)
-      image_rect.width = int(round(adjusted_width))
-    else:
-      adjusted_height = image_rect.width * self.__canvas_ratio
-      y = round((adjusted_height - image_rect.height) * 0.5)
-      image_rect.height = int(round(adjusted_height))
-    target = source.resize(image_rect.size(), Image.Resampling.BILINEAR, pad_rect.box())
-    target.paste(image, (x, y))
-    return target
+    def __crop_image(self, image: Image, image_ratio: float) -> Image:
+        if self.__crop == 0.0 or image_ratio == self.__canvas_ratio:
+            return image
+        is_wider = image_ratio < self.__canvas_ratio
+        crop = (100.0 - self.__crop) * 0.01
+        feature_box = self.__find_edges(image, crop, is_wider)
+        target = image.crop(feature_box.box())
+        return target
 
-  def __crop_image(self, image: Image, image_ratio: float) -> Image:
-    if self.__crop == 0.0 or image_ratio == self.__canvas_ratio:
-      return image
-    is_wider = image_ratio < self.__canvas_ratio
-    crop = (100.0 - self.__crop) * 0.01
-    feature_box = self.__find_edges(image, crop, is_wider)
-    target = image.crop(feature_box.box())
-    return target
-
-  def __find_edges(self, image: Image, crop: float, is_wider: bool) -> Rect:
-    image_rect = Rect.of(image)
-    box_rect: Rect
-    if self.__trim:
-      img = image.convert('L').filter(ImageFilter.BoxBlur(radius=5))
-      edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 1.0, -30))
-      edge = edge.crop(image_rect.shrink().box())
-      box = Image.Image.getbbox(edge)
-      box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
-    else:
-      box_rect = image_rect.copy()
-    (cx, cy) = image_rect.center()
-    (bx, by) = box_rect.center()
-    if is_wider:
-      adjusted_width = int(round(image_rect.width * crop))
-      c_crop = cx * crop
-      bx = max(int(round(bx - c_crop)), 0)
-      if bx + adjusted_width > image_rect.width:
-        bx = image_rect.width - adjusted_width - 1
-      image_rect.x = bx
-      image_rect.width = adjusted_width
-    else:
-      adjusted_height = int(round(image_rect.height * crop))
-      c_crop = cy * crop
-      by = max(int(round(by - c_crop)), 0)
-      if by + adjusted_height > image_rect.height:
-        by = image_rect.height - adjusted_height + 1
-      image_rect.y = by
-      image_rect.height = adjusted_height
-    return image_rect
+    def __find_edges(self, image: Image, crop: float, is_wider: bool) -> Rect:
+        image_rect = Rect.of(image)
+        box_rect: Rect
+        if self.__trim:
+            img = image.convert('L').filter(ImageFilter.BoxBlur(radius=5))
+            edge = img.filter(ImageFilter.Kernel((3, 3), (-1, -1, -1, -1, 8, -1, -1, -1, -1), 1.0, -30))
+            edge = edge.crop(image_rect.shrink().box())
+            box = Image.Image.getbbox(edge)
+            box_rect = Rect.of_tuple(box).grow() if box is not None else image_rect.copy()
+            # Close intermediate images as they're no longer needed
+            img.close()
+            edge.close()
+        else:
+            box_rect = image_rect.copy()
+        center_pos = image_rect.center()
+        cx, cy = center_pos.x, center_pos.y
+        box_center_pos = box_rect.center()
+        bx, by = box_center_pos.x, box_center_pos.y
+        if is_wider:
+            adjusted_width = int(round(image_rect.width * crop))
+            c_crop = cx * crop
+            bx = max(int(round(bx - c_crop)), 0)
+            if bx + adjusted_width > image_rect.width:
+                bx = image_rect.width - adjusted_width - 1
+            image_rect.x = bx
+            image_rect.width = adjusted_width
+        else:
+            adjusted_height = int(round(image_rect.height * crop))
+            c_crop = cy * crop
+            by = max(int(round(by - c_crop)), 0)
+            if by + adjusted_height > image_rect.height:
+                by = image_rect.height - adjusted_height + 1
+            image_rect.y = by
+            image_rect.height = adjusted_height
+        return image_rect
 
 
 def build_displays(config: Configuration):
-  displays = {}
-  for m in screeninfo.get_monitors():
-    display = DisplayInfo(m)
-    displays[m.name] = display
+    displays = {}
+    for m in config.monitors:
+        display = DisplayInfo(m)
+        displays[m.name] = display
 
-  for display in displays.values():
-    read_horz_offset_from_config(config, display, displays)
-    read_vert_offset_from_config(config, display, displays)
-  return normalize_displays(displays)
+    for display in displays.values():
+        read_horz_offset_from_config(config, display, displays)
+        read_vert_offset_from_config(config, display, displays)
+    return normalize_displays(displays)
 
 
 def normalize_displays(displays: {str: DisplayInfo}):
-  for display in displays.values():
-    logging.debug('display initial: %s', str(display))
-  h_sort = sorted(displays.values(), key=get_display_x)
-  v_sort = sorted(displays.values(), key=get_display_y)
-  init_horizontal_references(displays, h_sort)
-  init_vertical_references(displays, v_sort)
-  normalize_positions(displays)
-  for display in displays.values():
-    logging.debug('display after adjust: %s', str(display))
-  return displays
+    for display in displays.values():
+        logging.debug('display initial: %s', str(display))
+    h_sort = sorted(displays.values(), key=get_display_x)
+    v_sort = sorted(displays.values(), key=get_display_y)
+    init_horizontal_references(displays, h_sort)
+    init_vertical_references(displays, v_sort)
+    normalize_positions(displays)
+    for display in displays.values():
+        logging.debug('display after adjust: %s', str(display))
+    return displays
 
 
 def init_horizontal_references(displays: {str: DisplayInfo}, h_sorted_list):
-  n = len(h_sorted_list)
-  i = 0
-  while i < n:
-    display = h_sorted_list[i]
-    find_horz_relation(display, h_sorted_list, i)
-    if display.x_reference_mode == 'ABS':
-      display.mm_x = display.x_reference_offset_mm
-    elif display.x_reference_mode == 'F2F':
-      ref = displays[display.x_reference]
-      display.mm_x = ref.mm_x + ref.mm_width - display.mm_width + display.x_reference_offset_mm
-    elif display.x_reference_mode == 'S2S':
-      ref = displays[display.x_reference]
-      display.mm_x = ref.mm_x + display.x_reference_offset_mm
-    elif display.x_reference_mode == 'F2S':
-      ref = displays[display.x_reference]
-      display.mm_x = ref.mm_x + ref.mm_width + display.x_reference_offset_mm
-    i += 1
+    n = len(h_sorted_list)
+    # Cache references that might be accessed multiple times across different displays
+    ref_cache = {}
+    i = 0
+    while i < n:
+        display = h_sorted_list[i]
+        find_horz_relation(display, h_sorted_list, i)
+        if display.x_reference_mode == ReferenceMode.Absolute:
+            display.mm_x = display.x_reference_offset_mm
+        elif display.x_reference_mode is not None and display.x_reference is not None:
+            # Use cached reference if available, otherwise lookup and cache
+            ref_name = display.x_reference
+            if ref_name not in ref_cache:
+                ref_cache[ref_name] = displays[ref_name]
+            ref = ref_cache[ref_name]
+
+            if display.x_reference_mode == ReferenceMode.EndToEnd:
+                display.mm_x = ref.mm_x + ref.mm_width - display.mm_width + display.x_reference_offset_mm
+            elif display.x_reference_mode == ReferenceMode.StartToEnd:
+                display.mm_x = ref.mm_x + display.x_reference_offset_mm
+            elif display.x_reference_mode == ReferenceMode.EndToStart:
+                display.mm_x = ref.mm_x + ref.mm_width + display.x_reference_offset_mm
+        i += 1
 
 
 def read_horz_offset_from_config(config, display, displays):
-
-  if config and config.get(display.name, 'offsetXFrom', fallback=None):
-    ref_name: str = config.get(display.name, 'offsetXFrom', fallback=None)
-    if ref_name == ZERO:
-      display.x_reference_mode = 'ABS'
-      display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
-    elif ref_name in displays.keys():
-      ref: DisplayInfo = displays[ref_name]
-      if ref:
-        display.x_reference = ref_name
-        display.x_reference_mode = config.get(display.name, 'offsetXMode', fallback='S2S')
-        display.x_reference_offset_mm = float(config.get(display.name, 'offsetX', fallback='0'))
-        ref.x_ref_count += 1
+    if config:
+        display_config = config.currentProfile(display.name)
+        if display_config.offsetXFrom:
+            ref_name: str = display_config.offsetXFrom
+            if ref_name == ZERO:
+                display.x_reference_mode = ReferenceMode.Absolute
+                display.x_reference_offset_mm = display_config.offsetX
+            elif ref_name in displays.keys():
+                ref: DisplayInfo = displays[ref_name]
+                if ref:
+                    display.x_reference = ref_name
+                    display.x_reference_mode = display_config.offsetXMode
+                    display.x_reference_offset_mm = display_config.offsetX
+                    ref.x_ref_count += 1
 
 
 def find_horz_relation(display, h_sorted_list, i):
-  if display.x_reference_mode:
-    return
-  j = 0
-  while j < i:
-    ref: DisplayInfo = h_sorted_list[j]
-    if display.x == ref.x + ref.width:
-      display.x_reference = ref.name
-      display.x_reference_mode = 'F2S'
-      ref.x_ref_count += 1
-      break
-    elif display.x == ref.x:
-      display.x_reference = ref.name
-      display.x_reference_mode = 'S2S'
-      ref.x_ref_count += 1
-      break
-    elif display.x + display.width == ref.x + ref.width:
-      display.x_reference = ref.name
-      display.x_reference_mode = 'F2F'
-      ref.x_ref_count += 1
-      break
-    j += 1
-  if not display.x_reference_mode:
-    ref: DisplayInfo = find_display_left(display, h_sorted_list)
-    if ref:
-      display.x_reference = ref.name
-      display.x_reference_mode = 'F2S'
-      ref.x_ref_count += 1
+    if display.x_reference_mode:
+        return
+    j = 0
+    while j < i:
+        ref: DisplayInfo = h_sorted_list[j]
+        if display.x == ref.x + ref.width:
+            display.x_reference = ref.name
+            display.x_reference_mode = ReferenceMode.EndToStart
+            ref.x_ref_count += 1
+            break
+        if display.x == ref.x:
+            display.x_reference = ref.name
+            display.x_reference_mode = ReferenceMode.StartToEnd
+            ref.x_ref_count += 1
+            break
+        if display.x + display.width == ref.x + ref.width:
+            display.x_reference = ref.name
+            display.x_reference_mode = ReferenceMode.EndToEnd
+            ref.x_ref_count += 1
+            break
+        j += 1
+    if not display.x_reference_mode:
+        ref: DisplayInfo = find_display_left(display, h_sorted_list)
+        if ref:
+            display.x_reference = ref.name
+            display.x_reference_mode = ReferenceMode.EndToStart
+            ref.x_ref_count += 1
 
 
 def init_vertical_references(displays: {str: DisplayInfo}, v_sorted_list):
-  n = len(v_sorted_list)
-  i = 0
-  while i < n:
-    display = v_sorted_list[i]
-    find_vert_relation(display, v_sorted_list, i)
-    if display.y_reference_mode == 'ABS':
-      display.mm_y = display.y_reference_offset_mm
-    elif display.y_reference_mode == 'F2F':
-      ref = displays[display.y_reference]
-      display.mm_y = ref.mm_y + ref.mm_height - display.mm_height + display.y_reference_offset_mm
-    elif display.y_reference_mode == 'S2S':
-      ref = displays[display.y_reference]
-      display.mm_y = ref.mm_y + display.y_reference_offset_mm
-    elif display.y_reference_mode == 'F2S':
-      ref = displays[display.y_reference]
-      display.mm_y = ref.mm_y + ref.mm_height + display.y_reference_offset_mm
-    i += 1
+    n = len(v_sorted_list)
+    # Cache references that might be accessed multiple times across different displays
+    ref_cache = {}
+    i = 0
+    while i < n:
+        display = v_sorted_list[i]
+        find_vert_relation(display, v_sorted_list, i)
+        if display.y_reference_mode == ReferenceMode.Absolute:
+            display.mm_y = display.y_reference_offset_mm
+        elif display.y_reference_mode is not None and display.y_reference is not None:
+            # Use cached reference if available, otherwise lookup and cache
+            ref_name = display.y_reference
+            if ref_name not in ref_cache:
+                ref_cache[ref_name] = displays[ref_name]
+            ref = ref_cache[ref_name]
+
+            if display.y_reference_mode == ReferenceMode.EndToEnd:
+                display.mm_y = ref.mm_y + ref.mm_height - display.mm_height + display.y_reference_offset_mm
+            elif display.y_reference_mode == ReferenceMode.StartToEnd:
+                display.mm_y = ref.mm_y + display.y_reference_offset_mm
+            elif display.y_reference_mode == ReferenceMode.EndToStart:
+                display.mm_y = ref.mm_y + ref.mm_height + display.y_reference_offset_mm
+        i += 1
 
 
 def read_vert_offset_from_config(config, display, displays):
-  if config and config.get(display.name, 'offsetYFrom', fallback=None):
-    ref_name: str = config.get(display.name, 'offsetYFrom', fallback=None)
-    if ref_name == ZERO:
-      display.y_reference_mode = 'ABS'
-      display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
-    elif ref_name in displays.keys():
-      ref: DisplayInfo = displays[ref_name]
-      if ref:
-        display.y_reference = ref_name
-        display.y_reference_mode = config.get(display.name, 'offsetYMode', fallback='S2S')
-        display.y_reference_offset_mm = float(config.get(display.name, 'offsetY', fallback='0'))
-        ref.y_ref_count += 1
+    if config:
+        display_config = config.currentProfile(display.name)
+        if display_config.offsetYFrom:
+            ref_name: str = display_config.offsetYFrom
+            if ref_name == ZERO:
+                display.y_reference_mode = ReferenceMode.Absolute
+                display.y_reference_offset_mm = display_config.offsetY
+            elif ref_name in displays.keys():
+                ref: DisplayInfo = displays[ref_name]
+                if ref:
+                    display.y_reference = ref_name
+                    display.y_reference_mode = display_config.offsetYMode
+                    display.y_reference_offset_mm = display_config.offsetY
+                    ref.y_ref_count += 1
 
 
 def find_vert_relation(display, v_sorted_list, i):
-  if display.y_reference_mode:
-    return
-  j = 0
-  while j < i:
-    ref: DisplayInfo = v_sorted_list[j]
-    if display.y == ref.y + ref.height:
-      display.y_reference = ref.name
-      display.y_reference_mode = 'F2S'
-      ref.y_ref_count += 1
-      break
-    elif display.y == ref.y:
-      display.y_reference = ref.name
-      display.y_reference_mode = 'S2S'
-      ref.y_ref_count += 1
-      break
-    elif display.y + display.height == ref.y + ref.height:
-      display.y_reference = ref.name
-      display.y_reference_mode = 'F2F'
-      ref.y_ref_count += 1
-      break
-    j += 1
-  if not display.y_reference_mode:
-    ref: DisplayInfo = find_display_above(display, v_sorted_list)
-    if ref:
-      display.y_reference = ref.name
-      display.y_reference_mode = 'F2S'
-      ref.y_ref_count += 1
+    if display.y_reference_mode:
+        return
+    j = 0
+    while j < i:
+        ref: DisplayInfo = v_sorted_list[j]
+        if display.y == ref.y + ref.height:
+            display.y_reference = ref.name
+            display.y_reference_mode = ReferenceMode.EndToStart
+            ref.y_ref_count += 1
+            break
+        if display.y == ref.y:
+            display.y_reference = ref.name
+            display.y_reference_mode = ReferenceMode.StartToEnd
+            ref.y_ref_count += 1
+            break
+        if display.y + display.height == ref.y + ref.height:
+            display.y_reference = ref.name
+            display.y_reference_mode = ReferenceMode.EndToEnd
+            ref.y_ref_count += 1
+            break
+        j += 1
+    if not display.y_reference_mode:
+        ref: DisplayInfo = find_display_above(display, v_sorted_list)
+        if ref:
+            display.y_reference = ref.name
+            display.y_reference_mode = ReferenceMode.EndToStart
+            ref.y_ref_count += 1
 
 
 def get_display_x(display: DisplayInfo):
-  if display.x_ref_count > 0:
-    v = -display.x_ref_count
+    if display.x_ref_count > 0:
+        v = -display.x_ref_count
+        return v
+    v = display.x * 32768 + display.y
+    if not display.is_primary:
+        v += 16384
     return v
-  v = display.x * 32768 + display.y
-  if not display.is_primary:
-    v += 16384
-  return v
 
 
 def get_display_y(display: DisplayInfo):
-  if display.y_ref_count > 0:
-    v = -display.y_ref_count
+    if display.y_ref_count > 0:
+        v = -display.y_ref_count
+        return v
+    v = display.y * 32768 + display.x
+    if not display.is_primary:
+        v += 16384
     return v
-  v = display.y * 32768 + display.x
-  if not display.is_primary:
-    v += 16384
-  return v
 
 
 def normalize_positions(displays):
-  mm_origin_x = min([m.mm_x for m in displays.values()])
-  mm_origin_y = min([m.mm_y for m in displays.values()])
-  if mm_origin_y != 0 or mm_origin_x != 0:
-    for display in displays.values():
-      display.mm_x -= mm_origin_x
-      display.mm_y -= mm_origin_y
+    # Use generator expressions instead of list comprehensions to avoid creating intermediate lists
+    mm_origin_x = min(m.mm_x for m in displays.values())
+    mm_origin_y = min(m.mm_y for m in displays.values())
+    if mm_origin_y != 0 or mm_origin_x != 0:
+        for display in displays.values():
+            display.mm_x -= mm_origin_x
+            display.mm_y -= mm_origin_y
 
 
 def find_display_left(display: DisplayInfo, display_list: [DisplayInfo]):
-  candidates = {}
-  i = 0
-  while i < len(display_list):
-    ref = display_list[i]
-    if ref.name != display.name and ref.x < display.x:
-      delta_x = ref.x + ref.width - display.x
-      delta_y = ref.y - display.y
-      candidates[i] = delta_x * delta_x + delta_y * delta_y
-    i += 1
-  if candidates:
-    sorted_list = sorted((value, key) for (key, value) in candidates.items())
-    ref = display_list[sorted_list[0][1]]
-    return ref
-  return None
+    candidates = {}
+    i = 0
+    while i < len(display_list):
+        ref = display_list[i]
+        if ref.name != display.name and ref.x < display.x:
+            delta_x = ref.x + ref.width - display.x
+            delta_y = ref.y - display.y
+            candidates[i] = delta_x * delta_x + delta_y * delta_y
+        i += 1
+    if candidates:
+        sorted_list = sorted((value, key) for (key, value) in candidates.items())
+        ref = display_list[sorted_list[0][1]]
+        return ref
+    return None
 
 
 def find_display_above(display: DisplayInfo, display_list: [DisplayInfo]):
-  candidates = {}
-  i = 0
-  while i < len(display_list):
-    ref = display_list[i]
-    if ref.name != display.name and ref.y < display.y:
-      delta_x = ref.x - display.x
-      delta_y = ref.y + ref.height - display.y
-      candidates[i] = delta_x * delta_x + delta_y * delta_y
-    i += 1
-  if candidates:
-    sorted_list = sorted((value, key) for (key, value) in candidates.items())
-    ref = display_list[sorted_list[0][1]]
-    return ref
-  return None
+    candidates = {}
+    i = 0
+    while i < len(display_list):
+        ref = display_list[i]
+        if ref.name != display.name and ref.y < display.y:
+            delta_x = ref.x - display.x
+            delta_y = ref.y + ref.height - display.y
+            candidates[i] = delta_x * delta_x + delta_y * delta_y
+        i += 1
+    if candidates:
+        sorted_list = sorted((value, key) for (key, value) in candidates.items())
+        ref = display_list[sorted_list[0][1]]
+        return ref
+    return None
+
+
+def construct_displays(config: Configuration):
+    displays = {}
+    display_list = []
+    for m in config.monitors:
+        display = DisplayInfo(m)
+        displays[m.name] = display
+        display_list.append(display)
+
+    i = 0
+    while i < len(display_list):
+        ref = display_list[i]
+        ref.x_reference_offset_mm = 0.0
+        ref.y_reference_offset_mm = 0.0
+        if ref.x == 0:
+            ref.x_reference = ZERO
+            ref.x_reference_mode = ReferenceMode.Absolute
+        else:
+            left_of_ref = find_display_left(ref, display_list)
+            if left_of_ref:
+                ref.x_reference = left_of_ref.name
+                ref.x_reference_mode = ReferenceMode.EndToStart
+        if ref.y == 0:
+            ref.y_reference = ZERO
+            ref.y_reference_mode = ReferenceMode.Absolute
+        else:
+            above_of_ref = find_display_above(ref, display_list)
+            if above_of_ref:
+                ref.y_reference = above_of_ref.name
+                ref.y_reference_mode = ReferenceMode.EndToStart
+        i += 1
+    return displays
 
 
 # from tensorboard's util.py
 def get_user_config_directory():
-  if os.name == 'nt':
-    appdata = os.getenv('LOCALAPPDATA')
-    if appdata:
-      return appdata
-    appdata = os.getenv('APPDATA')
-    if appdata:
-      return appdata
-    return None
-  xdg_config_home = os.getenv('XDG_CONFIG_HOME')
-  if xdg_config_home:
-    return xdg_config_home
-  return os.path.join(os.path.expanduser('~'), '.config')
+    if os.name == 'nt':
+        appdata = os.getenv('LOCALAPPDATA')
+        if appdata:
+            return appdata
+        appdata = os.getenv('APPDATA')
+        if appdata:
+            return appdata
+        return None
+    xdg_config_home = os.getenv('XDG_CONFIG_HOME')
+    if xdg_config_home:
+        return xdg_config_home
+    return os.path.join(os.path.expanduser('~'), '.config')
 
 
 def find_config_file():
-  _local_config = os.path.join(os.path.dirname(__file__), 'spanned-image.ini')
-  _user_config_path = get_user_config_directory()
-  _user_config = None
-  if _user_config_path is not None:
-    _user_config = os.path.join(_user_config_path, 'spanned-image.ini')
-  if _user_config is not None and os.path.exists(_user_config):
-    return _user_config
-  elif os.path.exists(_local_config):
-    return _local_config
-  return None
+    _local_config = os.path.join(os.path.dirname(__file__), 'spanned-image.toml')
+    _user_config_path = get_user_config_directory()
+    _user_config = None
+    if _user_config_path is not None:
+        _user_config = os.path.join(_user_config_path, 'spanned-image.toml')
+    if _user_config is not None and os.path.exists(_user_config):
+        return _user_config
+    if os.path.exists(_local_config):
+        return _local_config
+    return None
 
 
 def read_image(input_file) -> Image:
-  _image = Image.open(input_file, mode='r')
-  return _image
+    """Read and fully load an image, closing the file handle."""
+    with Image.open(input_file, mode='r') as img:
+        # Convert to RGB to ensure consistent format and load into memory
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        # Create a copy to ensure file handle is closed
+        _image = img.copy()
+    return _image
+
+
+def determine_profile(config: Configuration):
+    """Determine the current profile based on monitor configuration.
+
+    1. Get monitors as semicolon-separated string
+    2. Compute MD5 hash of monitors
+    3. Find profile section with matching hash_value
+    4. If found, set currentProfile to that profile
+    5. If not found, create new profile section and set currentProfile
+    """
+    # Step 1: Get monitors as semicolon-separated string
+    monitors_list = config.monitors
+    monitor_data_str = ';'.join(str(m) for m in monitors_list)
+    monitor_names = [m.name for m in monitors_list if m.name is not None]
+
+    # Step 2: Compute MD5 hash
+    hash_value = hashlib.md5(monitor_data_str.encode('utf-8')).hexdigest()
+
+    # Step 3: Find profile section with matching hash_value
+    matched_profile = config.find_profile_by_hash(hash_value)
+
+    # Step 4: If profile matched, set currentProfile
+    if matched_profile:
+        config.set_current_profile(matched_profile)
+    else:
+        # Step 5: Create new profile section
+        profile_name = 'profile_' + hash_value[-8:]
+        config.create_profile(profile_name, monitor_data_str, monitor_names, hash_value)
+        config.set_current_profile(profile_name)
+
+
+def populate_profile(config: Configuration):
+    """Populate missing monitor sections in the current profile with default positions.
+
+    1. Checks whether the monitor sections are complete for the current profile
+    2. If not, creates monitor section(s) for the profile with default position,
+       according to the monitor's (x, y) coordinates converted to mm.
+    """
+    # Get current monitors
+    monitors_list = config.monitors
+
+    # Check which monitors are missing sections
+    any_missing = False
+    for monitor in monitors_list:
+        if monitor.name is None:
+            continue
+
+        # Check if monitor section exists (nested table like [profile_1.DP-4])
+        if not config.has_monitor_section(monitor.name):
+            any_missing = True
+            break
+
+    if any_missing:
+        normalized_displays = construct_displays(config)
+        for display in normalized_displays.values():
+            # Convert None values to defaults for TOML serialization
+            # If reference is None, use ZERO (absolute positioning)
+            # If reference_mode is None, use Absolute mode
+            offset_x_from = display.x_reference
+            offset_x_mode = display.x_reference_mode
+            offset_y_from = display.y_reference
+            offset_y_mode = display.y_reference_mode
+
+            config.set_monitor_section(
+                display.name,
+                offset_x_from,
+                offset_x_mode,
+                display.x_reference_offset_mm,
+                offset_y_from,
+                offset_y_mode,
+                display.y_reference_offset_mm
+            )
 
 
 def spanned_image(config, input_file, output_file):
-  displays = build_displays(config)
-  canvas = Canvas(displays, config)
-  image = read_image(input_file)
-  canvas.set_image(image)
-  result = canvas.paint()
-  logging.debug('saving image: %s', output_file)
-  try:
-    result.save(output_file)
-    config = Configuration()
-    if config.debug:
-      result.save('/tmp/spanned-image.png')
-  except Exception as e:
-    logging.error("saving writing %s with error %s", output_file, e)
+    displays = build_displays(config)
+    canvas = Canvas(displays, config)
+    image = read_image(input_file)
+    try:
+        canvas.set_image(image)
+        result = canvas.paint()
+        logging.debug('saving image: %s', output_file)
+        try:
+            result.save(output_file)
+            if config.debug:
+                result.save(os.path.join(TEMP_DIR, 'spanned-image.png'))
+        except Exception as e:
+            logging.error("saving writing %s with error %s", output_file, e)
+        finally:
+            # Clean up result image if it was created
+            if result is not None:
+                result.close()
+    finally:
+        # Clean up input image
+        if image is not None:
+            image.close()
 
 
-def print_monitors():
-  for m in screeninfo.get_monitors():
-    print(str(m))
+def print_monitors(config: Configuration):
+    for m in config.monitors:
+        print(str(m))
 
 
 def print_usage():
-  print('Usage: {0} <input file> <output file>'.format(sys.argv[0]))
+    print(f'Usage: {sys.argv[0]} <input file> <output file>')
 
 
 def main():
-  config = Configuration()
-  if config.debug:
-    logging.basicConfig(filename='/tmp/spanned_image.log', level=logging.DEBUG, format='')
-  else:
-    logging.basicConfig(filename='/tmp/spanned_image.log', level=logging.INFO, format='')
-  logging.info('parameters: %s', sys.argv)
-  if len(sys.argv) != 3:
-    print_usage()
-    print_monitors()
-    if len(sys.argv) == 2:
-      image = read_image(sys.argv[1])
-      print(image.size)
+    config = Configuration(screeninfo.get_monitors())
+    determine_profile(config)
+    populate_profile(config)
+    if config.debug:
+        logging.basicConfig(filename=os.path.join(TEMP_DIR, 'spanned_image.log'), level=logging.DEBUG, format='')
+    else:
+        logging.basicConfig(filename=os.path.join(TEMP_DIR, 'spanned_image.log'), level=logging.INFO, format='')
+    logging.info('parameters: %s', sys.argv)
+    if len(sys.argv) != 3:
+        print_usage()
+        print_monitors(config)
+        if len(sys.argv) == 2:
+            image = read_image(sys.argv[1])
+            try:
+                print(image.size)
+            finally:
+                image.close()
 
-  else:
-    try:
-      logging.debug('parameters: %s %s', sys.argv[1], sys.argv[2])
-      spanned_image(config, sys.argv[1], sys.argv[2])
-    except Exception as e:
-      logging.error("Exception %s", e)
+    else:
+        try:
+            logging.debug('parameters: %s %s', sys.argv[1], sys.argv[2])
+            spanned_image(config, sys.argv[1], sys.argv[2])
+        except Exception as e:
+            logging.error("Exception %s", e)
 
 
 if __name__ == '__main__':
-  main()
+    main()

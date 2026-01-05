@@ -1,2 +1,4 @@
 screeninfo~=0.8.1
 pillow~=11.1.0
+tomli~=2.0.1
+tomli-w~=1.0.0
